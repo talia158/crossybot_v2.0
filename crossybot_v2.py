@@ -466,7 +466,6 @@ class DensityMaskUtils:
         )
 
     @staticmethod
-    @staticmethod
     def free_mask_gray(
         disp_bgr: np.ndarray,
         bands: list[tuple[int, int]],
@@ -2646,6 +2645,7 @@ def main():
     CHAR_BGR_DEFAULT = (92, 172, 255)
     CHAR_TOL_DEFAULT = 4
     SHOW_CHAR_DEBUG = False
+    CHAR_DEBUG_WIN = "Character Debug"
     offset_log: list[dict] = []
     angle_deg = 14.5
     SHOW_PLANNER_VIZ = True
@@ -2731,7 +2731,8 @@ def main():
         )
         triggered, go_frac = gameover.update(proc_bgr)
         if triggered:
-            win = gw.getWindowsWithTitle("MSI App Player")[0]
+            _wins = gw.getWindowsWithTitle("MSI App Player")
+            win = _wins[0] if _wins else None
             # pyautogui.click(150, 430)
             print("GAME OVER")
             band_class_store = []
