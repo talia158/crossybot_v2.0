@@ -2867,7 +2867,7 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     SHOW_CHAR_DEBUG = False
     CHAR_DEBUG_WIN = "Character Debug"
     offset_log: list[dict] = []
-    angle_deg = 14.5 if is_desktop else 0.0
+    angle_deg = 14.5
     SHOW_PLANNER_VIZ = True
     if capture_backend is None:
         cfg = CaptureConfig(monitor=1, region=(0, 27, 247, 449))
@@ -2885,14 +2885,15 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     vertical_fraction = 0.6
     offset = 0
     last_moving = None
-    lane_h = 22
+    lane_h = 23
     margin_px = 1
     offset_n_lines = 5
     frame_i = 0
     M = None
     raw_w = raw_h = None
     param = 12
-    param2 = 14.5 if is_desktop else 0.0
+    param2 = 12.5
+
     last_ts = time.perf_counter()
     USE_KALMAN = False
     gameover = GameOverDetector(
@@ -2936,6 +2937,7 @@ def main(capture_backend: Optional[CaptureBackend] = None,
         frame_bgr = cap.next_frame()
         last_ts = frame_start
         raw_h, raw_w = frame_bgr.shape[:2]
+
         if M is None:
             center = (raw_w // 2, raw_h // 2)
             M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
