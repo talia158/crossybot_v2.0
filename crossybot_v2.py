@@ -28,6 +28,7 @@ try:
 except ImportError:
     Quartz = None
 import abc
+import gc
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.ticker import FuncFormatter
 
@@ -128,43 +129,10 @@ BAND_COV_SAMPLE_FRAC = 1.0
 BAND_AGREEMENT_THRESH = 0.95
 OFFSET_SEARCH_RADIUS = 5
 VELOCITY_WINDOW_S = 2.0
-VELOCITY_FUTURE_PROJECTION_S = 2.0
 K3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 cv2.useOptimized()
 matplotlib.use("Agg")
 
-def render_lines_visual_base(
-    lines: Sequence[Sequence[int]] | np.ndarray | None,
-    width: int,
-    height: int,
-    x_scale: int = 1,
-    y_scale: int = 1,
-) -> Optional[np.ndarray]:
-    if lines is None or len(lines) == 0 or width <= 0 or height <= 0:
-        return None
-    vis = np.zeros((height, width, 3), dtype=np.uint8)
-    for line in lines:
-        if line is None or len(line) != 4:
-            continue
-        x1, y1, x2, y2 = [float(v) for v in line]
-        cv2.line(
-            vis,
-            (int(round(x1)), int(round(y1))),
-            (int(round(x2)), int(round(y2))),
-            (255, 255, 255),
-            1,
-            cv2.LINE_8,
-        )
-    if x_scale != 1 or y_scale != 1:
-        vis = ImageOps.resize(
-            vis,
-            (
-                vis.shape[1] * max(1, int(x_scale)),
-                vis.shape[0] * max(1, int(y_scale)),
-            ),
-            interpolation=cv2.INTER_NEAREST,
-        )
-    return vis
 
 class LaneType(Enum):
     GREEN = 0
@@ -1589,7 +1557,6 @@ class BotStateMachine:
 
 class Planner:
     def __init__(self, *, occ_history_len: int = 120, cols_per_sec: float = 30.0):
-        self._latest_hough_lines: list[Optional[np.ndarray]] = []
         self._tracked_occ_history: Deque[tuple[float, dict[int, np.ndarray]]] = deque(
             maxlen=max(1, int(occ_history_len))
         )
@@ -1601,13 +1568,7 @@ class Planner:
         except (TypeError, ValueError):
             cps = 30.0
         self._cols_per_sec = cps if cps > 0 else 30.0
-        self._last_band_lines: list[list[dict[str, float]]] = []
-        self._recent_segment_slopes: list[Deque[tuple[float, float]]] = []
         self._latest_character_rect: Optional[tuple[int, int, int, int]] = None
-
-    def update_hough_lines(self, hough_lines: Sequence[Optional[np.ndarray]]) -> None:
-        # store latest hough output for downstream planning heuristics
-        self._latest_hough_lines = list(hough_lines) if hough_lines is not None else []
 
     def push_tracked_occ_lines(
         self,
@@ -1636,349 +1597,6 @@ class Planner:
     def plan_move(self) -> str:
         return "up"
 
-    def project_segments(
-        self,
-        *,
-        hough_lines: Sequence[Optional[np.ndarray]],
-        segment_locations: Sequence[Optional[list[dict]]],
-        hough_visual_dims: Sequence[Optional[tuple[int, int]]] | None = None,
-        character_rect_x: Optional[tuple[int, int]] = None,
-        future_time_s: float,
-        visualize: bool = False,
-    ) -> tuple[list[list[dict]], list[Optional[np.ndarray]]]:
-        projections: list[list[dict]] = []
-        visuals: list[Optional[np.ndarray]] = []
-
-        self._latest_character_rect_x = character_rect_x
-
-        hough_lines_list = list(hough_lines) if hough_lines is not None else []
-        segment_locations_list = (
-            list(segment_locations) if segment_locations is not None else []
-        )
-
-        hough_visual_dims_list = (
-            list(hough_visual_dims) if hough_visual_dims is not None else []
-        )
-
-        extra_future_cols = max(0.0, float(self._cols_per_sec))
-        now_ts = time.perf_counter()
-        cutoff_ts = now_ts - 4.0
-
-        while len(self._recent_segment_slopes) < len(hough_lines_list):
-            self._recent_segment_slopes.append(deque())
-
-        for band_idx, lines in enumerate(hough_lines_list):
-            segments = (
-                segment_locations_list[band_idx]
-                if band_idx < len(segment_locations_list)
-                else None
-            )
-            segments_list = list(segments) if segments else []
-            projected_band: list[dict] = []
-            vis: Optional[np.ndarray] = None
-
-            col_candidates: list[float] = []
-            row_candidates: list[float] = []
-            projection_draws: list[tuple[float, float, float, float]] = []
-            hough_line_coords: list[tuple[float, float, float, float]] = []
-            slope_history = self._recent_segment_slopes[band_idx]
-            while slope_history and slope_history[0][0] < cutoff_ts:
-                slope_history.popleft()
-            stored_slope_this_frame = False
-
-            for seg in segments_list:
-                seg_col = float(seg.get("col", 0.0))
-                y0 = float(seg.get("row_start", 0.0))
-                y1 = float(seg.get("row_end", y0))
-                col_candidates.append(seg_col)
-                row_candidates.extend([y0, y1])
-
-            window_end_x: float | None = None
-            if segments_list:
-                segment_cols = [float(seg.get("col", 0.0)) for seg in segments_list]
-                if segment_cols:
-                    window_end_x = max(segment_cols)
-            if window_end_x is None and lines is not None and len(lines):
-                window_end_x = max(
-                    max(float(line[0]), float(line[2]))
-                    for line in lines
-                    if line is not None and len(line) >= 2
-                )
-            if window_end_x is None:
-                window_end_x = 0.0
-
-            line_infos: list[dict[str, float]] = []
-
-            if lines is not None and len(lines):
-                for raw_line in lines:
-                    if raw_line is None or len(raw_line) != 4:
-                        continue
-                    x1, y1, x2, y2 = [float(v) for v in raw_line]
-                    dx = x2 - x1
-                    slope = (y2 - y1) / dx if abs(dx) >= 1e-6 else 0.0
-                    if x2 >= x1:
-                        x_right, y_right = x2, y2
-                    else:
-                        x_right, y_right = x1, y1
-                    target_future_x = window_end_x
-                    if extra_future_cols > 0:
-                        target_future_x = max(target_future_x, window_end_x + extra_future_cols)
-                    x_future = max(target_future_x, x_right)
-                    advance_dx = x_future - x_right
-                    y_future = y_right + slope * advance_dx
-
-                    # clamp projection to window borders if a window height is known
-                    window_height = None
-                    if band_idx < len(hough_visual_dims_list):
-                        dims = hough_visual_dims_list[band_idx]
-                        if dims is not None:
-                            window_height = float(dims[1])
-                    if window_height is None and row_candidates:
-                        window_height = max(row_candidates)
-                    if window_height is None:
-                        window_height = 0.0
-                    if window_height > 0 and abs(dx) >= 1e-6:
-                        if y_future < 0:
-                            needed_dy = -y_right
-                            clipped_dx = needed_dy / (slope) if abs(slope) > 1e-6 else None
-                            if clipped_dx is not None and clipped_dx >= 0:
-                                clipped_dx = min(advance_dx, clipped_dx)
-                                x_future = x_right + clipped_dx
-                                y_future = y_right + slope * clipped_dx
-                        elif y_future > window_height:
-                            needed_dy = window_height - y_right
-                            clipped_dx = needed_dy / (slope) if abs(slope) > 1e-6 else None
-                            if clipped_dx is not None and clipped_dx >= 0:
-                                clipped_dx = min(advance_dx, clipped_dx)
-                                x_future = x_right + clipped_dx
-                                y_future = y_right + slope * clipped_dx
-
-                    col_candidates.extend([x1, x2])
-                    row_candidates.extend([y1, y2])
-                    hough_line_coords.append((x1, y1, x2, y2))
-                    line_infos.append(
-                        {
-                            "x1": x1,
-                            "y1": y1,
-                            "x2": x2,
-                            "y2": y2,
-                            "dx": dx,
-                            "slope": slope,
-                            "x_right": x_right,
-                            "y_right": y_right,
-                        }
-                    )
-
-            def _line_y_at(info: dict[str, float], x_val: float) -> float:
-                dx_val = info["x2"] - info["x1"]
-                if abs(dx_val) < 1e-6:
-                    return float(info["y2"])
-                t = (x_val - info["x1"]) / dx_val
-                return info["y1"] + t * (info["y2"] - info["y1"])
-
-            window_height: Optional[float] = None
-            if band_idx < len(hough_visual_dims_list):
-                dims = hough_visual_dims_list[band_idx]
-                if dims is not None:
-                    window_height = float(dims[1])
-            if window_height is None and row_candidates:
-                window_height = float(max(row_candidates))
-
-            used_lines: set[int] = set()
-            segment_to_line: dict[int, Optional[int]] = {}
-
-            for seg_idx, seg in enumerate(segments_list):
-                seg_col = float(seg.get("col", window_end_x))
-                y0 = float(seg.get("row_start", 0.0))
-                y1 = float(seg.get("row_end", y0))
-                seg_center = 0.5 * (y0 + y1)
-                best_idx = None
-                best_dist = float("inf")
-                for idx, info in enumerate(line_infos):
-                    y_pred = _line_y_at(info, seg_col)
-                    dist = abs(y_pred - seg_center)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_idx = idx
-                segment_to_line[seg_idx] = best_idx
-                if best_idx is not None:
-                    used_lines.add(best_idx)
-
-            def _clamp_rows(start_val: float, end_val: float) -> tuple[float, float]:
-                if window_height is None or window_height <= 0:
-                    return start_val, end_val
-                start_clamped = max(0.0, min(window_height, start_val))
-                end_clamped = max(0.0, min(window_height, end_val))
-                return start_clamped, end_clamped
-
-            def _extend_with_slope(
-                start_row: float,
-                end_row: float,
-                origin_col: float,
-                slope_val: float,
-                target_x: float,
-            ) -> tuple[float, float, float]:
-                dx_future = target_x - origin_col
-                if slope_val != 0.0 and window_height is not None and window_height > 0.0:
-                    y_low = min(start_row, end_row)
-                    y_high = max(start_row, end_row)
-                    delta_target = slope_val * dx_future
-                    delta_min = -y_low
-                    delta_max = window_height - y_high
-                    delta_clamped = max(delta_min, min(delta_max, delta_target))
-                    dx_future = delta_clamped / slope_val
-                delta = slope_val * dx_future
-                new_start = start_row + delta
-                new_end = end_row + delta
-                new_start, new_end = _clamp_rows(new_start, new_end)
-                return new_start, new_end, origin_col + dx_future
-
-            # Extend matched segments first
-            for seg_idx, seg in enumerate(segments_list):
-                seg_col = float(seg.get("col", window_end_x))
-                y0 = float(seg.get("row_start", 0.0))
-                y1 = float(seg.get("row_end", y0))
-                height = y1 - y0
-                assigned_line_idx = segment_to_line.get(seg_idx)
-                slope_val = 0.0
-                derived_from_line = False
-                if assigned_line_idx is not None:
-                    slope_val = float(line_infos[assigned_line_idx]["slope"])
-                    if abs(slope_val) >= 1e-6:
-                        derived_from_line = True
-                if abs(slope_val) < 1e-6 and slope_history:
-                    slope_val = slope_history[-1][1]
-                target_future_x = max(seg_col + extra_future_cols, window_end_x)
-                new_start, new_end, col_future = _extend_with_slope(
-                    y0,
-                    y1,
-                    seg_col,
-                    slope_val,
-                    target_future_x,
-                )
-                if int(round(min(new_start, new_end))) != int(round(max(new_start, new_end))):
-                    projected_band.append(
-                        {
-                            "row_start": int(round(min(new_start, new_end))),
-                            "row_end": int(round(max(new_start, new_end))),
-                            "col": int(round(col_future)),
-                        }
-                    )
-                    col_candidates.append(col_future)
-                    row_candidates.extend([new_start, new_end])
-                    center_now = y0 + 0.5 * height
-                    center_future = center_now + slope_val * (col_future - seg_col)
-                    projection_draws.append(
-                        (seg_col, center_now, col_future, center_future)
-                    )
-                    if (
-                        derived_from_line
-                        and not stored_slope_this_frame
-                        and abs(slope_val) >= 1e-6
-                    ):
-                        slope_history.append((now_ts, slope_val))
-                        stored_slope_this_frame = True
-
-            # Extend leftover lines not matched to segments
-            unused_lines = [
-                (idx, info) for idx, info in enumerate(line_infos) if idx not in used_lines
-            ]
-            for idx, info in unused_lines:
-                x_right = info["x_right"]
-                y_right = info["y_right"]
-                slope = info["slope"]
-                target_future_x = max(window_end_x, x_right + extra_future_cols)
-                advance_dx = target_future_x - x_right
-                y_future = y_right + slope * advance_dx
-                if window_height is not None and window_height > 0 and abs(info["dx"]) >= 1e-6:
-                    if y_future < 0:
-                        needed_dy = -y_right
-                        clipped_dx = needed_dy / slope if abs(slope) > 1e-6 else None
-                        if clipped_dx is not None and clipped_dx >= 0:
-                            clipped_dx = min(advance_dx, clipped_dx)
-                            target_future_x = x_right + clipped_dx
-                            y_future = y_right + slope * clipped_dx
-                    elif y_future > window_height:
-                        needed_dy = window_height - y_right
-                        clipped_dx = needed_dy / slope if abs(slope) > 1e-6 else None
-                        if clipped_dx is not None and clipped_dx >= 0:
-                            clipped_dx = min(advance_dx, clipped_dx)
-                            target_future_x = x_right + clipped_dx
-                            y_future = y_right + slope * clipped_dx
-
-                row_start = min(y_right, y_future)
-                row_end = max(y_right, y_future)
-                col_future = target_future_x
-
-                projected_band.append(
-                    {
-                        "row_start": int(round(row_start)),
-                        "row_end": int(round(row_end)),
-                        "col": int(round(col_future)),
-                    }
-                )
-
-                col_candidates.extend([x_right, col_future])
-                row_candidates.extend([y_right, y_future])
-                projection_draws.append(
-                    (x_right, y_right, col_future, y_future)
-                )
-
-            if visualize and (hough_line_coords or projection_draws):
-                width = height = None
-                if band_idx < len(hough_visual_dims_list):
-                    dims = hough_visual_dims_list[band_idx]
-                    if dims is not None:
-                        base_width = max(1, int(round(dims[0])))
-                        width = max(1, int(round(base_width + max(0.0, extra_future_cols))))
-                        height = int(dims[1])
-                if width is None or height is None:
-                    max_col = max(col_candidates) if col_candidates else window_end_x
-                    max_col = max_col if max_col is not None else 0.0
-                    max_row = max(row_candidates) if row_candidates else 0.0
-                    width = max(1, int(math.ceil(max(0.0, max_col)) + extra_future_cols) + 2)
-                    height = max(1, int(math.ceil(max(0.0, max_row))) + 1)
-                max_proj_col = max(col_candidates) if col_candidates else 0.0
-                width = max(width or 1, int(math.ceil(max(0.0, max_proj_col))) + 2)
-                lines_for_visual: list[tuple[int, int, int, int]] = [
-                    (
-                        int(round(x1)),
-                        int(round(y1)),
-                        int(round(x2)),
-                        int(round(y2)),
-                    )
-                    for x1, y1, x2, y2 in hough_line_coords
-                ]
-                vis = render_lines_visual_base(lines_for_visual, width, height)
-                if vis is None and width > 0 and height > 0:
-                    vis = np.zeros((height, width, 3), dtype=np.uint8)
-                if vis is not None:
-                    for x_start, y_start, x_end, y_end in projection_draws:
-                        xs = int(round(x_start))
-                        ys = int(round(y_start))
-                        xe = int(round(x_end))
-                        ye = int(round(y_end))
-                        xs = max(0, min(width - 1, xs))
-                        ys = max(0, min(height - 1, ys))
-                        xe = max(0, min(width - 1, xe))
-                        ye = max(0, min(height - 1, ye))
-                        cv2.line(vis, (xs, ys), (xe, ye), (0, 255, 0), 1, cv2.LINE_AA)
-                    if segments:
-                        for seg in segments:
-                            if seg is None:
-                                continue
-                            seg_col = int(round(float(seg.get("col", 0.0))))
-                            y0 = float(seg.get("row_start", 0.0))
-                            y1 = float(seg.get("row_end", y0))
-                            seg_row = int(round((y0 + y1) * 0.5))
-                            seg_col = max(0, min(width - 1, seg_col))
-                            seg_row = max(0, min(height - 1, seg_row))
-                            cv2.circle(vis, (seg_col, seg_row), 3, (0, 0, 255), 1, cv2.LINE_AA)
-
-            projections.append(projected_band)
-            visuals.append(vis)
-
-        return projections, visuals
 
 
 
@@ -1990,13 +1608,6 @@ class VelocityEstimator:
         time_on_x: bool = True,
         max_horizontal_run_px: int | None = None,
         repeat_suppression: int = 4,
-        hough_rho: float = 1.0,
-        hough_theta: float = np.pi / 180.0,
-        hough_threshold: int = 25,
-        hough_min_line_length: float = 10.0,
-        hough_max_line_gap: float = 4.0,
-        future_projection_s: float = 2.0,
-        sobel_temporal_and_frames: int = 1,
         sampling_rate_hz: float = 30.0,
         resample_method: str = "nearest",
     ):
@@ -2013,36 +1624,6 @@ class VelocityEstimator:
         self._max_run_px = max_run
         self._repeat_suppression = max(0, int(repeat_suppression))
         try:
-            rho_val = float(hough_rho)
-        except (TypeError, ValueError):
-            rho_val = 1.0
-        self._hough_rho = rho_val if rho_val > 0 else 1.0
-        try:
-            theta_val = float(hough_theta)
-        except (TypeError, ValueError):
-            theta_val = float(np.pi / 180.0)
-        self._hough_theta = theta_val if theta_val > 0 else float(np.pi / 180.0)
-        try:
-            threshold_val = int(hough_threshold)
-        except (TypeError, ValueError):
-            threshold_val = 1
-        self._hough_threshold = max(1, threshold_val)
-        try:
-            min_len_val = float(hough_min_line_length)
-        except (TypeError, ValueError):
-            min_len_val = 1.0
-        self._hough_min_line_length = max(1.0, min_len_val)
-        try:
-            max_gap_val = float(hough_max_line_gap)
-        except (TypeError, ValueError):
-            max_gap_val = 0.0
-        self._hough_max_line_gap = max(0.0, max_gap_val)
-        try:
-            sobel_and_val = int(sobel_temporal_and_frames)
-        except (TypeError, ValueError):
-            sobel_and_val = 1
-        self._sobel_temporal_and_frames = max(1, sobel_and_val)
-        try:
             sample_rate = float(sampling_rate_hz)
         except (TypeError, ValueError):
             sample_rate = 25.0
@@ -2055,12 +1636,6 @@ class VelocityEstimator:
         self._times: list[Deque[float]] = []
         self._widths: list[int] = []
         self._raw_history: list[Deque[np.ndarray]] = []
-        self._latest_hough_lines: list[Optional[np.ndarray]] = []
-        self._latest_sobel_visual: list[Optional[np.ndarray]] = []
-        self._latest_actual_hough_visual: list[Optional[np.ndarray]] = []
-        self._latest_hough_line_details: list[Optional[Dict[str, Any]]] = []
-        self._hough_line_history: list[Deque[Dict[str, Any]]] = []
-        self._persistent_line_sets: list[dict[str, Optional[np.ndarray]]] = []
         self._color_rows: list[Deque[np.ndarray]] = []
         self._prev_segments: list[Optional[list[dict]]] = []
         self._prev_obj_ids: list[Optional[list[int]]] = []
@@ -2083,21 +1658,11 @@ class VelocityEstimator:
                 self._rows[band].clear()
                 self._times[band].clear()
                 self._raw_history[band].clear()
-                self._latest_hough_lines[band] = None
-                self._latest_sobel_visual[band] = None
-                self._latest_actual_hough_visual[band] = None
-                self._latest_hough_line_details[band] = None
-                self._hough_line_history[band].clear()
-                self._persistent_line_sets[band] = {"pos": None, "neg": None}
                 self._widths[band] = width
 
             line_img = (li_raw > 0).astype(np.uint8) * 255
             self._rows[band].append(line_img)
             self._times[band].append(t_now)
-            self._latest_hough_lines[band] = None
-            self._latest_hough_line_details[band] = None
-            self._hough_line_history[band].clear()
-            self._latest_actual_hough_visual[band] = None
             self._trim_band(band)
 
     def push_color_lines(self, color_lines: List[np.ndarray], t_now: float) -> None:
@@ -2134,12 +1699,6 @@ class VelocityEstimator:
         _shift(self._times, deque())
         _shift(self._widths, 0)
         _shift(self._raw_history, deque())
-        _shift(self._latest_hough_lines, None)
-        _shift(self._latest_sobel_visual, None)
-        _shift(self._latest_actual_hough_visual, None)
-        _shift(self._latest_hough_line_details, None)
-        _shift(self._hough_line_history, deque())
-        _shift(self._persistent_line_sets, {"pos": None, "neg": None})
 
         if hasattr(self, "_latest_line_map"):
             old_map = getattr(self, "_latest_line_map", {})
@@ -2181,622 +1740,6 @@ class VelocityEstimator:
             )
         return vis
 
-    def probabilistic_hough( 
-        self,
-        band: int,
-        *,
-        orientation: str | None = None,
-        x_scale: int = 1,
-        y_scale: int = 1,
-        return_visual: bool = True,
-    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[list[tuple[int, int]]]]:
-
-        if not self._valid_band(band):
-            return None, None, None
-
-        self._latest_sobel_visual[band] = None
-
-        orient = (orientation or self._time_axis).lower()
-        if orient not in ("x", "y"):
-            orient = self._time_axis
-
-        image = self._get_image_uniform_time(
-            band,
-            self._sampling_rate_hz,
-            orientation=orient,
-            method=self._resample_method,
-        )
-        if image is None:
-            self._latest_hough_lines[band] = None
-            empty_vis = np.zeros((40, 200, 3), np.uint8) if return_visual else None
-            self._latest_sobel_visual[band] = None
-            self._latest_hough_line_details[band] = None
-            return None, empty_vis, None
-
-        xt = image
-        if xt.dtype != np.uint8:
-            xt_u8 = np.clip(np.rint(xt), 0, 255).astype(np.uint8)
-        else:
-            xt_u8 = xt.copy()
-
-        if xt_u8.ndim == 1:
-            xt_u8 = xt_u8.reshape(1, -1)
-
-        if xt_u8.size == 0:
-            self._latest_hough_lines[band] = None
-            empty_vis = np.zeros((40, 200, 3), np.uint8) if return_visual else None
-            self._latest_sobel_visual[band] = None
-            self._latest_hough_line_details[band] = None
-            return None, empty_vis, None
-
-        if int(np.max(xt_u8)) > 0:
-            _, edge_map = cv2.threshold(xt_u8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        else:
-            edge_map = xt_u8.copy()
-
-        # Sobel (vertical) -> abs -> normalize
-        sobel_v = cv2.Sobel(edge_map.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
-        sobel_abs = np.abs(sobel_v)
-        sobel_norm = cv2.normalize(sobel_abs, None, 0, 255, cv2.NORM_MINMAX)
-        if sobel_norm.dtype != np.uint8:
-            sobel_norm = np.clip(np.rint(sobel_norm), 0, 255).astype(np.uint8)
-
-        # Sobel -> threshold for Hough input tune0
-        edge_map = sobel_norm.copy()
-        _, edge_map = cv2.threshold(edge_map, 100, 255, cv2.THRESH_BINARY)
-        max_run = getattr(self, "_max_run_px", None)
-        if max_run is not None and max_run > 0:
-            horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max_run, 1))
-            long_runs = cv2.morphologyEx(edge_map, cv2.MORPH_OPEN, horiz_kernel, iterations=1)
-            edge_map = cv2.subtract(edge_map, long_runs)
-
-        # # Morphological closing (dilate then erode) to bridge tiny gaps
-        # morph_kernel = np.ones((3, 3), np.uint8)
-        # edge_map = cv2.dilate(edge_map, morph_kernel, iterations=1)#tune0
-
-        base_h, base_w = edge_map.shape[:2]
-
-        # Optionally downscale edges before Hough for performance (kept disabled)
-        hough_input = edge_map
-        scale_back_x = 1.0
-        scale_back_y = 1.0
-
-        # Hough (probabilistic) ---------------
-        lines = cv2.HoughLinesP(
-            hough_input,
-            rho=self._hough_rho,
-            theta=self._hough_theta,
-            threshold=int(self._hough_threshold),
-            minLineLength=float(self._hough_min_line_length),
-            maxLineGap=float(self._hough_max_line_gap),
-        )
-        if lines is None:
-            lines_arr = None
-        else:
-            lines_arr = lines.reshape(-1, 4).astype(np.float32)
-            if scale_back_x != 1.0 or scale_back_y != 1.0:
-                max_x = float(max(0, base_w - 1))
-                max_y = float(max(0, base_h - 1))
-                lines_arr[:, [0, 2]] = np.clip(
-                    lines_arr[:, [0, 2]] * scale_back_x, 0.0, max_x
-                )
-                lines_arr[:, [1, 3]] = np.clip(
-                    lines_arr[:, [1, 3]] * scale_back_y, 0.0, max_y
-                )
-            lines_arr = np.rint(lines_arr).astype(int)
-
-        # Pre-filter: reject near-horizontal, zero-length
-        if lines_arr is not None and len(lines_arr) > 0:
-            kept = []
-            for x1, y1, x2, y2 in lines_arr:
-                dy = y2 - y1
-                dx = x2 - x1
-                if dx == 0 and dy == 0:
-                    continue
-                length = math.hypot(float(dx), float(dy))
-                if length <= 0:
-                    continue
-                slope_y = abs(float(dy)) / length
-                if slope_y < 0.2:  # near-horizontal -> skip
-                    continue
-                kept.append([x1, y1, x2, y2])
-            lines_arr = np.array(kept, dtype=int) if kept else None
-
-        # Work within current Sobel extent
-        target_w = base_w
-        target_h = base_h
-
-        sobel_canvas = hough_input.copy()
-        sobel_vis = cv2.cvtColor(sobel_canvas, cv2.COLOR_GRAY2BGR)
-        if x_scale != 1 or y_scale != 1:
-            sobel_vis = ImageOps.resize(
-                sobel_vis,
-                (
-                    sobel_vis.shape[1] * max(1, int(x_scale)),
-                    sobel_vis.shape[0] * max(1, int(y_scale)),
-                ),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        segments: list[tuple[int, int]] = []
-        latest_column = hough_input[:, -1].copy() if hough_input.shape[1] > 0 else None
-        if latest_column is not None and latest_column.size > 0:
-            mask = latest_column > 0
-            if np.any(mask):
-                mask_int = mask.astype(np.int8)
-                transitions = np.diff(mask_int)
-                starts = np.where(transitions == 1)[0] + 1
-                ends = np.where(transitions == -1)[0]
-                if mask[0]:
-                    starts = np.concatenate(([0], starts))
-                if mask[-1]:
-                    ends = np.concatenate((ends, [mask.size - 1]))
-                segments = list(zip(starts, ends))
-                if segments:
-                    scale_x = max(1, int(x_scale))
-                    scale_y = max(1, int(y_scale))
-                    x_recent = max(0, sobel_vis.shape[1] - scale_x)
-                    for seg_start, seg_end in segments:
-                        cy = (seg_start + seg_end) * 0.5
-                        sy = int(
-                            np.clip(round(cy * scale_y), 0, sobel_vis.shape[0] - 1)
-                        )
-                        cv2.circle(sobel_vis, (x_recent, sy), 2, (0, 0, 255), 1)
-        self._latest_sobel_visual[band] = sobel_vis
-
-        # Prepare Sobel map for overlap checks
-        edge_padded = edge_map.copy()
-
-        # --- Use line_map + AND-overlap to decide which lines to keep ---
-        line_map = None
-        kept_indices: list[int] = []
-
-        if lines_arr is not None and len(lines_arr):
-            # Configurable thresholds ---------------------
-            min_px_abs = int(getattr(self, "_line_overlap_min_px", 20))          # minimal overlapped pixels with Sobel
-            min_frac = float(getattr(self, "_line_overlap_min_frac", 0.25))      # minimal fraction of line length 
-
-            for idx, (x1, y1, x2, y2) in enumerate(lines_arr):
-                # Rasterize this candidate line
-                tmp = np.zeros((target_h, target_w), dtype=np.uint8)
-                cv2.line(tmp, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1, cv2.LINE_8)
-
-                # Overlap this line with the Sobel edges
-                overlap = cv2.bitwise_and(tmp, edge_padded)
-
-                # Count overlapped pixels
-                overlap_count = int(np.count_nonzero(overlap))
-
-                # Relative requirement by geometric length (optional)
-                length_px = max(1.0, math.hypot(float(x2 - x1), float(y2 - y1)))
-                ok_rel = (overlap_count >= (min_frac * length_px)) if min_frac > 0.0 else True
-                ok_abs = (overlap_count >= min_px_abs)
-
-                if ok_abs and ok_rel:
-                    kept_indices.append(idx)
-
-        lines_filtered = None
-        lines_filtered_raw = None
-        if lines_arr is not None and kept_indices:
-            kept_raw = lines_arr[np.array(kept_indices, dtype=int)]
-            lines_filtered_raw = kept_raw.copy()
-            lines_filtered = self._extend_lines_to_canvas(
-                kept_raw,
-                target_w,
-                target_h,
-            )
-        lines_final = lines_filtered.copy() if lines_filtered is not None else None
-
-        # --- Persistent line set management (for Visualization) ---
-        def _line_slope_sign(line: Sequence[int], eps: float = 1e-6) -> Optional[str]:
-            x1, y1, x2, y2 = [float(v) for v in line]
-            dx = x2 - x1
-            dy = y2 - y1
-            if abs(dx) < eps:
-                if abs(dy) < eps:
-                    return None
-                return "pos" if dy > 0 else "neg"
-            slope = dy / dx
-            if slope > eps:
-                return "pos"
-            if slope < -eps:
-                return "neg"
-            return None
-
-        stored_sets = self._persistent_line_sets[band]
-        if not isinstance(stored_sets, dict):
-            stored_sets = {"pos": None, "neg": None}
-            self._persistent_line_sets[band] = stored_sets
-
-        line_sets_current = {
-            "pos": stored_sets.get("pos").copy() if stored_sets.get("pos") is not None else None,
-            "neg": stored_sets.get("neg").copy() if stored_sets.get("neg") is not None else None,
-        }
-        line_sets_updated = {
-            key: arr.copy() if arr is not None else None for key, arr in line_sets_current.items()
-        }
-
-        existing_metrics = {"pos": None, "neg": None}
-        for sign in ("pos", "neg"):
-            arr = line_sets_current[sign]
-            if arr is None or len(arr) == 0:
-                continue
-            existing_line = self._select_rightmost_line(arr, target_w, target_h)
-            if existing_line is not None:
-                existing_metrics[sign] = self._line_right_order_value(existing_line)
-
-        lines_by_sign: dict[str, list[np.ndarray]] = {"pos": [], "neg": []}
-        if lines_final is not None and len(lines_final):
-            for line in lines_final:
-                sign = _line_slope_sign(line)
-                if sign in lines_by_sign:
-                    lines_by_sign[sign].append(np.asarray(line, dtype=int))
-
-        replace_tol = float(getattr(self, "_line_replace_metric_tol", 8.0))
-
-        for sign in ("pos", "neg"):
-            candidates = lines_by_sign[sign]
-            if not candidates:
-                continue
-            arr_updated = line_sets_updated[sign]
-            metrics_list: list[Optional[float]] = []
-            if arr_updated is not None and len(arr_updated):
-                for stored_line in arr_updated:
-                    metrics_list.append(self._line_right_order_value(stored_line))
-            threshold = (
-                max((val for val in metrics_list if val is not None), default=None)
-                if metrics_list
-                else None
-            )
-            for line in candidates:
-                order_val = self._line_right_order_value(line)
-                if order_val is None:
-                    continue
-                replaced = False
-                if arr_updated is not None and metrics_list:
-                    for idx, val in enumerate(metrics_list):
-                        if val is None:
-                            continue
-                        delta = order_val - val
-                        if -replace_tol <= delta <= replace_tol:
-                            arr_updated[idx] = line
-                            metrics_list[idx] = order_val
-                            replaced = True
-                            break
-                if replaced:
-                    continue
-                # threshold may need refresh after replacements
-                threshold = (
-                    max((val for val in metrics_list if val is not None), default=None)
-                    if metrics_list
-                    else None
-                )
-                should_add = False
-                if threshold is None or arr_updated is None or len(arr_updated) == 0:
-                    should_add = True
-                else:
-                    if order_val > threshold + 1e-6:
-                        should_add = True
-                if should_add:
-                    if arr_updated is None:
-                        arr_updated = np.asarray([line], dtype=int)
-                        metrics_list = [order_val]
-                    else:
-                        arr_updated = np.vstack([arr_updated, line])
-                        metrics_list.append(order_val)
-                    threshold = max((val for val in metrics_list if val is not None), default=None)
-            line_sets_updated[sign] = arr_updated
-
-        line_sets_for_display = {
-            sign: (line_sets_updated[sign].copy() if line_sets_updated[sign] is not None else None)
-            for sign in ("pos", "neg")
-        }
-        rightmost_line = self._select_rightmost_line(lines_final, target_w, target_h)
-
-        lines_for_output: list[list[int]] = []
-        if lines_final is not None and len(lines_final):
-            lines_for_output.extend(
-                [list(map(int, line_vals)) for line_vals in lines_final]
-            )
-        for arr in line_sets_for_display.values():
-            if arr is None:
-                continue
-            lines_for_output.extend([list(map(int, vals)) for vals in arr])
-
-        base_canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        if x_scale != 1 or y_scale != 1:
-            base_canvas = ImageOps.resize(
-                base_canvas,
-                (
-                    base_canvas.shape[1] * max(1, int(x_scale)),
-                    base_canvas.shape[0] * max(1, int(y_scale)),
-                ),
-                interpolation=cv2.INTER_NEAREST,
-            )
-
-        actual_vis = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        lines_white = self._render_lines_visual(lines_filtered, target_w, target_h, x_scale, y_scale)
-        if lines_white is not None:
-            actual_vis = lines_white
-        for arr in line_sets_for_display.values():
-            if arr is None:
-                continue
-            for persistent_line in arr:
-                self._highlight_line_on_visual(
-                    actual_vis,
-                    persistent_line,
-                    x_scale,
-                    y_scale,
-                    color=(0, 255, 255),
-                    thickness=1,
-                )
-        self._latest_actual_hough_visual[band] = actual_vis
-
-        # Persist line_map for programmatic use (not visualized)
-        if not hasattr(self, "_latest_line_map"):
-            self._latest_line_map = {}
-        if lines_final is not None and len(lines_final):
-            line_map = -np.ones((target_h, target_w), dtype=np.int32)
-            for idx, (x1, y1, x2, y2) in enumerate(lines_final):
-                tmp = np.zeros((target_h, target_w), dtype=np.uint8)
-                cv2.line(tmp, (int(x1), int(y1)), (int(x2), int(y2)), 255, 1, cv2.LINE_8)
-                assign_mask = (tmp > 0) & (line_map < 0)
-                if np.any(assign_mask):
-                    line_map[assign_mask] = idx
-            self._latest_line_map[band] = line_map
-        else:
-            self._latest_line_map[band] = None
-
-        vis = None
-        if return_visual:
-            vis = actual_vis.copy()
-
-
-        # Shift persistent line sets left by 1px for next frame
-        shifted_sets: dict[str, Optional[np.ndarray]] = {"pos": None, "neg": None}
-        for sign in ("pos", "neg"):
-            arr = line_sets_updated[sign]
-            if arr is None or len(arr) == 0:
-                continue
-            shifted = arr.astype(float)
-            shifted[:, [0, 2]] -= 1.0
-            extended_shifted: list[list[int]] = []
-            for line_vals in shifted:
-                ext = self._extend_line_to_canvas(
-                    line_vals,
-                    target_w,
-                    target_h,
-                )
-                if ext is not None:
-                    extended_shifted.append(ext)
-            if extended_shifted:
-                shifted_sets[sign] = np.asarray(extended_shifted, dtype=int)
-            else:
-                shifted_sets[sign] = None
-        self._persistent_line_sets[band] = shifted_sets
-
-        lines_out = (
-            np.asarray(lines_for_output, dtype=int) if lines_for_output else None
-        )
-
-        # Update latest kept lines
-        if lines_out is None or len(lines_out) == 0:
-            self._latest_hough_lines[band] = None
-        else:
-            self._latest_hough_lines[band] = lines_out.copy()
-        col_idx = int(hough_input.shape[1] - 1) if hough_input.shape[1] > 0 else 0
-        segments_info = (
-            [
-                {"row_start": int(s), "row_end": int(e), "col": col_idx}
-                for s, e in segments
-            ]
-            if segments
-            else None
-        )
-        return lines_out, vis, segments_info
-
-
-    def _extend_lines_to_canvas(
-        self,
-        lines: np.ndarray,
-        width: int,
-        height: int,
-    ) -> Optional[np.ndarray]:
-        if lines is None or len(lines) == 0:
-            return None
-        width = max(1, int(width))
-        height = max(1, int(height))
-        extended: list[list[int]] = []
-        for line in lines:
-            ext_line = self._extend_line_to_canvas(line, width, height)
-            if ext_line is not None:
-                extended.append(ext_line)
-        if not extended:
-            return None
-        return np.array(extended, dtype=int)
-
-    def _render_lines_visual(
-        self,
-        lines: Optional[np.ndarray],
-        width: int,
-        height: int,
-        x_scale: int = 1,
-        y_scale: int = 1,
-    ) -> Optional[np.ndarray]:
-        return render_lines_visual_base(lines, width, height, x_scale, y_scale)
-
-    @staticmethod
-    def _line_top_intersection_x(line: Sequence[int]) -> Optional[tuple[float, int]]:
-        if line is None or len(line) != 4:
-            return None
-        x1, y1, x2, y2 = [float(v) for v in line]
-        dx = x2 - x1
-        dy = y2 - y1
-        eps = 1e-6
-        target_y = 0.0
-        if abs(dy) < eps:
-            if abs(y1 - target_y) < eps:
-                return max(x1, x2), 0
-            return None
-        t = (target_y - y1) / dy
-        x = x1 + t * (x2 - x1)
-        slope_sign = 0
-        if abs(dx) >= eps:
-            slope = dy / dx
-            if slope > 0:
-                slope_sign = 1
-            elif slope < 0:
-                slope_sign = -1
-            else:
-                slope_sign = 0
-        else:
-            slope_sign = 1 if dy > 0 else -1
-        return x, slope_sign
-
-    @classmethod
-    def _line_right_order_value(cls, line: Sequence[int]) -> Optional[float]:
-        info = cls._line_top_intersection_x(line)
-        if info is None:
-            return None
-        x_val, slope_sign = info
-        return x_val
-
-    @classmethod
-    def _select_rightmost_line(
-        cls,
-        lines: Optional[np.ndarray],
-        width: int,
-        height: int,
-    ) -> Optional[np.ndarray]:
-        if lines is None or len(lines) == 0 or width <= 0 or height <= 0:
-            return None
-        best_line = None
-        best_metric = -math.inf
-        for line in lines:
-            metric = cls._line_right_order_value(line)
-            if metric is None:
-                continue
-            if metric > best_metric:
-                best_metric = metric
-                best_line = np.asarray(line, dtype=float)
-        return best_line
-
-    @staticmethod
-    def _highlight_line_on_visual(
-        vis: np.ndarray,
-        line: Sequence[int] | np.ndarray,
-        x_scale: int,
-        y_scale: int,
-        color: tuple[int, int, int] = (255, 255, 0),
-        thickness: int = 2,
-    ) -> None:
-        if vis is None or line is None:
-            return
-        sx = max(1, int(x_scale))
-        sy = max(1, int(y_scale))
-        x1, y1, x2, y2 = [int(round(v)) for v in line]
-        p1 = (int(round(x1 * sx)), int(round(y1 * sy)))
-        p2 = (int(round(x2 * sx)), int(round(y2 * sy)))
-        cv2.line(vis, p1, p2, color, thickness, cv2.LINE_8)
-
-    @staticmethod
-    def _extend_line_to_canvas(
-        line: Sequence[int],
-        width: int,
-        height: int,
-    ) -> Optional[list[int]]:
-        if width <= 0 or height <= 0:
-            return None
-        x1, y1, x2, y2 = [float(v) for v in line]
-        dx = x2 - x1
-        dy = y2 - y1
-        eps = 1e-6
-        x_min = 0.0
-        y_min = 0.0
-        x_max = float(max(0, width - 1))
-        y_max = float(max(0, height - 1))
-        if abs(dx) < eps and abs(dy) < eps:
-            x = float(np.clip(x1, x_min, x_max))
-            y = float(np.clip(y1, y_min, y_max))
-            val = int(round(x)), int(round(y))
-            return [val[0], val[1], val[0], val[1]]
-        points: list[tuple[float, float]] = []
-        if abs(dx) > eps:
-            for x_edge in (x_min, x_max):
-                t = (x_edge - x1) / dx
-                y_edge = y1 + t * dy
-                if y_min - eps <= y_edge <= y_max + eps:
-                    points.append((x_edge, float(np.clip(y_edge, y_min, y_max))))
-        if abs(dy) > eps:
-            for y_edge in (y_min, y_max):
-                t = (y_edge - y1) / dy
-                x_edge = x1 + t * dx
-                if x_min - eps <= x_edge <= x_max + eps:
-                    points.append((float(np.clip(x_edge, x_min, x_max)), y_edge))
-        if not points:
-            x1c = float(np.clip(x1, x_min, x_max))
-            y1c = float(np.clip(y1, y_min, y_max))
-            x2c = float(np.clip(x2, x_min, x_max))
-            y2c = float(np.clip(y2, y_min, y_max))
-            return [int(round(x1c)), int(round(y1c)), int(round(x2c)), int(round(y2c))]
-        unique: list[tuple[float, float]] = []
-        for x, y in points:
-            if not any(abs(x - ux) < 1e-4 and abs(y - uy) < 1e-4 for ux, uy in unique):
-                unique.append((x, y))
-        if len(unique) == 1:
-            unique.append(unique[0])
-        if len(unique) > 2:
-            best_pair: Optional[tuple[tuple[float, float], tuple[float, float]]] = None
-            best_dist = -1.0
-            for i in range(len(unique)):
-                for j in range(i + 1, len(unique)):
-                    xi, yi = unique[i]
-                    xj, yj = unique[j]
-                    dist = (xi - xj) ** 2 + (yi - yj) ** 2
-                    if dist > best_dist:
-                        best_dist = dist
-                        best_pair = ((xi, yi), (xj, yj))
-            if best_pair is None:
-                p1, p2 = unique[0], unique[-1]
-            else:
-                p1, p2 = best_pair
-        else:
-            p1, p2 = unique[0], unique[-1]
-
-        def clamp_point(pt: tuple[float, float]) -> tuple[int, int]:
-            px = float(np.clip(pt[0], x_min, x_max))
-            py = float(np.clip(pt[1], y_min, y_max))
-            return int(round(px)), int(round(py))
-
-        a = clamp_point(p1)
-        b = clamp_point(p2)
-        return [a[0], a[1], b[0], b[1]]
-
-
-    def get_hough_line_history(self, band: int, window_s: float = 10.0) -> list[Dict[str, Any]]:
-        if not self._valid_band(band):
-            return []
-        history = self._hough_line_history[band]
-        if not history:
-            return []
-        now = float(time.time())
-        window = max(0.0, float(window_s))
-        cutoff = now - window
-        result: list[Dict[str, Any]] = []
-        for packet in history:
-            ts = float(packet.get("timestamp", 0.0))
-            if ts >= cutoff:
-                lines = packet.get("lines", [])
-                result.append(
-                    {
-                        "band": int(packet.get("band", band)),
-                        "orientation": packet.get("orientation"),
-                        "timestamp": ts,
-                        "line_count": int(packet.get("line_count", len(lines))),
-                        "lines": [dict(line) for line in lines],
-                    }
-                )
-        return result
-
     # ── Hash-based velocity: match objects by (length, color) across frames ──
 
     @staticmethod
@@ -2827,6 +1770,20 @@ class VelocityEstimator:
                 "mean_bgr": tuple(int(c) for c in mean_bgr),
             })
         return segments
+
+    @staticmethod
+    def _lsq_slope(ts: np.ndarray, xs: np.ndarray) -> float:
+        """Least-squares slope (velocity) of xs over ts."""
+        if len(ts) < 2:
+            return 0.0
+        t = ts - ts[0]
+        n = len(t)
+        st = t.sum()
+        sx = xs.sum()
+        stt = (t * t).sum()
+        stx = (t * xs).sum()
+        denom = n * stt - st * st
+        return float((n * stx - st * sx) / denom) if abs(denom) > 1e-12 else 0.0
 
     @staticmethod
     def _match_segments(
@@ -2909,29 +1866,31 @@ class VelocityEstimator:
                 self._obj_tracks[obj_id] = deque()
             self._obj_band[obj_id] = band
             track = self._obj_tracks[obj_id]
-            track.append((t_now, seg["centroid_x"]))
+            track.append((t_now, float(seg["x_start"]), float(seg["x_end"])))
             # trim to window
             while len(track) > 1 and (t_now - track[0][0]) > self._track_window_s:
                 track.popleft()
-            # compute velocity via least-squares fit over window
-            if len(track) >= 3:
+            # compute velocity — use non-stationary edge when one is clamped
+            vel_px_s = 0.0
+            if len(track) >= 2:
+                W = occ_line.shape[0]
                 ts = np.array([p[0] for p in track])
-                xs = np.array([p[1] for p in track])
-                ts -= ts[0]  # shift to avoid precision issues
-                # vel = slope of best-fit line x(t)
-                n = len(ts)
-                sum_t = ts.sum()
-                sum_x = xs.sum()
-                sum_tt = (ts * ts).sum()
-                sum_tx = (ts * xs).sum()
-                denom = n * sum_tt - sum_t * sum_t
-                vel_px_s = float((n * sum_tx - sum_t * sum_x) / denom) if abs(denom) > 1e-12 else 0.0
-            elif len(track) == 2:
-                dt = track[-1][0] - track[0][0]
-                dx = track[-1][1] - track[0][1]
-                vel_px_s = dx / dt if dt > 1e-6 else 0.0
-            else:
-                vel_px_s = 0.0
+                lefts = np.array([p[1] for p in track])
+                rights = np.array([p[2] for p in track])
+                left_var = np.var(lefts)
+                right_var = np.var(rights)
+                edge_var_thresh = 5.0  # px² — near-stationary edge
+                near_boundary = 5  # px from screen edge
+                left_clamped = left_var < edge_var_thresh and lefts.mean() < near_boundary
+                right_clamped = right_var < edge_var_thresh and rights.mean() > W - near_boundary
+                # pick the edge(s) to use for velocity
+                if left_clamped and not right_clamped:
+                    xs = rights  # left stuck at boundary, use right edge
+                elif right_clamped and not left_clamped:
+                    xs = lefts   # right stuck at boundary, use left edge
+                else:
+                    xs = (lefts + rights) / 2.0  # centroid
+                vel_px_s = self._lsq_slope(ts, xs)
             detections.append({
                 "velocity_px_per_s": vel_px_s,
                 "mean_color_bgr": seg["mean_bgr"],
@@ -2971,22 +1930,6 @@ class VelocityEstimator:
                         0.25, color, 1, cv2.LINE_AA)
         return detections, vis
 
-    def get_latest_sobel_visual(self, band: int) -> Optional[np.ndarray]:
-        if not self._valid_band(band):
-            return None
-        sobel_vis = self._latest_sobel_visual[band]
-        if sobel_vis is None:
-            return None
-        return sobel_vis.copy()
-
-    def get_latest_actual_hough_visual(self, band: int) -> Optional[np.ndarray]:
-        if not self._valid_band(band):
-            return None
-        vis = self._latest_actual_hough_visual[band]
-        if vis is None:
-            return None
-        return vis.copy()
-
     def _ensure_bands(self, n: int) -> None:
         grow = n - len(self._rows)
         if grow <= 0:
@@ -2995,12 +1938,6 @@ class VelocityEstimator:
         self._times += [deque() for _ in range(grow)]
         self._widths += [0 for _ in range(grow)]
         self._raw_history += [deque() for _ in range(grow)]
-        self._latest_hough_lines += [None for _ in range(grow)]
-        self._latest_sobel_visual += [None for _ in range(grow)]
-        self._latest_actual_hough_visual += [None for _ in range(grow)]
-        self._latest_hough_line_details += [None for _ in range(grow)]
-        self._hough_line_history += [deque() for _ in range(grow)]
-        self._persistent_line_sets += [{"pos": None, "neg": None} for _ in range(grow)]
         self._color_rows += [deque() for _ in range(grow)]
         self._prev_segments += [None for _ in range(grow)]
         self._prev_obj_ids += [None for _ in range(grow)]
@@ -3160,6 +2097,9 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     param2 = 14.5
 
     last_ts = time.perf_counter()
+    # Disable automatic GC to prevent random ~0.5s freezes; run manually
+    gc.disable()
+    _gc_interval = 120  # collect every N frames
     USE_KALMAN = False
     gameover = GameOverDetector(
         hsv_lo=(17, 160, 200),
@@ -3183,15 +2123,8 @@ def main(capture_backend: Optional[CaptureBackend] = None,
         time_on_x=True,
         max_horizontal_run_px=5,
         repeat_suppression=2,
-        hough_rho=1.0,
-        hough_theta=np.pi / 180.0,
-        hough_threshold=10,#set threshold here--------------------------------
-        hough_min_line_length=1.0,
-        hough_max_line_gap=4.0,
-        future_projection_s=VELOCITY_FUTURE_PROJECTION_S,
     )
     planner = Planner(cols_per_sec=velocity_estimator._sampling_rate_hz)
-    projection_windows: set[str] = set()
     band_class_store: list[LaneType] = []
     while True:
         frame_start = time.perf_counter()
@@ -3470,49 +2403,6 @@ def main(capture_backend: Optional[CaptureBackend] = None,
             occ_lines=occ_lines, tracked_indices=tracked_indices, t_now=push_time
         )
 
-        hough_lines_11_15 = []
-        hough_visual_dims_11_15: list[Optional[tuple[int, int]]] = []
-        segment_infos: list[Optional[list[dict]]] = []
-        for idx in tracked_indices:
-            _hough_lines, hough_vis, segment_info = velocity_estimator.probabilistic_hough(
-                band=idx,
-                orientation="x",
-                x_scale=1,
-                y_scale=1,
-                return_visual=True,
-            )
-            hough_lines_11_15.append(_hough_lines)
-            if hough_vis is not None:
-                h, w = hough_vis.shape[:2]
-                hough_visual_dims_11_15.append((w, h))
-            else:
-                hough_visual_dims_11_15.append(None)
-            segment_infos.append(segment_info)
-            sobel_vis = velocity_estimator.get_latest_sobel_visual(idx)
-            # actual_hough_vis = velocity_estimator.get_latest_actual_hough_visual(param)
-            # if actual_hough_vis is not None:
-            #     cv2.namedWindow("Velocity XT HoughP Actual", cv2.WINDOW_NORMAL)
-            #     cv2.imshow("Velocity XT HoughP Actual", actual_hough_vis)
-        planner.update_hough_lines(hough_lines_11_15)
-        projections, proj_vis_list = planner.project_segments(
-            hough_lines=hough_lines_11_15,
-            segment_locations=segment_infos,
-            hough_visual_dims=hough_visual_dims_11_15,
-            character_rect_x=character_rect_x,
-            future_time_s=VELOCITY_FUTURE_PROJECTION_S,
-            visualize=True,
-        )
-        if False and _should_display:
-            for idx, proj_vis in enumerate(proj_vis_list):
-                win_name = f"SP Band {idx}"
-                if proj_vis is None:
-                    continue
-                if win_name not in projection_windows:
-                    projection_windows.add(win_name)
-                    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-                cv2.imshow(win_name, proj_vis)
-
-        # move_cmd = planner.plan_move()
         move_cmd = 'wait'
 
         if not triggered:
@@ -3572,6 +2462,9 @@ def main(capture_backend: Optional[CaptureBackend] = None,
             param -= 1
             # param2 -= 0.1
         work_time = time.perf_counter() - frame_start
+        # manual GC during idle time to avoid random freezes
+        if frame_i % _gc_interval == 0:
+            gc.collect(generation=0)
         sleep_s = max(0.0, target_dt - work_time)
         if sleep_s > 0:
             time.sleep(sleep_s)
