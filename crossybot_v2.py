@@ -1170,6 +1170,32 @@ class GeometryAnalyzer:
         return occ_lines
 
     @staticmethod
+    def build_color_lines_for_bands(
+        frame_bgr: np.ndarray,
+        bands: list[tuple[int, int]],
+        lane_h: int,
+        use_bottom_slice: bool = True,
+    ) -> list[np.ndarray]:
+        """Extract a 1D color strip (W, 3) BGR from each band's sampling row."""
+        H, W = frame_bgr.shape[:2]
+        color_lines: list[np.ndarray] = []
+        for y0, y1 in bands:
+            y0c = max(0, min(H, int(y0)))
+            y1c = max(0, min(H, int(y1)))
+            band_h = y1c - y0c
+            if band_h <= 0:
+                color_lines.append(np.zeros((W, 3), np.uint8))
+                continue
+            if use_bottom_slice:
+                slice_h = max(1, min(lane_h, band_h))
+                y_top, y_bot = y1c - slice_h, y1c
+                y_mid = (y_top + y_bot - 1) // 2
+            else:
+                y_mid = (y0c + y1c - 1) // 2
+            color_lines.append(frame_bgr[y_mid, :, :].copy())
+        return color_lines
+
+    @staticmethod
     def _cosine_sim(a: np.ndarray, b: np.ndarray, eps: float = 1e-6) -> float:
         a = np.asarray(a, np.float32)
         b = np.asarray(b, np.float32)
@@ -2035,6 +2061,13 @@ class VelocityEstimator:
         self._latest_hough_line_details: list[Optional[Dict[str, Any]]] = []
         self._hough_line_history: list[Deque[Dict[str, Any]]] = []
         self._persistent_line_sets: list[dict[str, Optional[np.ndarray]]] = []
+        self._color_rows: list[Deque[np.ndarray]] = []
+        self._prev_segments: list[Optional[list[dict]]] = []
+        self._prev_obj_ids: list[Optional[list[int]]] = []
+        self._next_obj_id: int = 0
+        self._obj_tracks: dict[int, Deque[tuple[float, float]]] = {}  # obj_id → deque of (time, centroid_x)
+        self._obj_band: dict[int, int] = {}  # obj_id → band index
+        self._track_window_s: float = 0.5  # time window for velocity averaging
 
     def push_occ_lines(self, occ_lines: List[np.ndarray], t_now: float) -> None:
         self._ensure_bands(len(occ_lines))
@@ -2066,6 +2099,27 @@ class VelocityEstimator:
             self._hough_line_history[band].clear()
             self._latest_actual_hough_visual[band] = None
             self._trim_band(band)
+
+    def push_color_lines(self, color_lines: List[np.ndarray], t_now: float) -> None:
+        """Push one (W, 3) BGR strip per band. Call after push_occ_lines."""
+        self._ensure_bands(len(color_lines))
+        t_now = float(t_now)
+        for band, cline in enumerate(color_lines):
+            if cline is None:
+                continue
+            row = np.asarray(cline, dtype=np.uint8)
+            if row.ndim == 1:
+                row = np.zeros((row.shape[0], 3), np.uint8)
+            width = row.shape[0]
+            if self._widths[band] != width:
+                self._color_rows[band].clear()
+                continue
+            self._color_rows[band].append(row)
+            # trim to match temporal window
+            while (len(self._color_rows[band]) > 1
+                   and len(self._times[band]) > 0
+                   and len(self._color_rows[band]) > len(self._times[band])):
+                self._color_rows[band].popleft()
 
     def shift_bands_down_by_one(self) -> None:
         """Shift per-band buffers down by one slot, clearing the newest slot."""
@@ -2743,6 +2797,180 @@ class VelocityEstimator:
                 )
         return result
 
+    # ── Hash-based velocity: match objects by (length, color) across frames ──
+
+    @staticmethod
+    def _segment_occ_line(
+        occ_line: np.ndarray,
+        color_line: np.ndarray,
+    ) -> list[dict]:
+        """Find contiguous occupied runs, compute (length, mean_color) signature."""
+        occ = (np.asarray(occ_line).ravel() > 0).astype(np.uint8)
+        W = occ.shape[0]
+        if W == 0:
+            return []
+        padded = np.concatenate(([0], occ, [0]))
+        d = np.diff(padded)
+        starts = np.where(d == 1)[0]
+        ends = np.where(d == -1)[0]
+        segments = []
+        for s, e in zip(starts, ends):
+            length = e - s
+            if length < 2:
+                continue
+            mean_bgr = color_line[s:e].mean(axis=0).astype(np.uint8)
+            segments.append({
+                "x_start": int(s),
+                "x_end": int(e),
+                "length": int(length),
+                "centroid_x": float(s + e) / 2.0,
+                "mean_bgr": tuple(int(c) for c in mean_bgr),
+            })
+        return segments
+
+    @staticmethod
+    def _match_segments(
+        prev_segs: list[dict],
+        curr_segs: list[dict],
+        max_color_dist: float = 80.0,
+        max_length_ratio: float = 2.5,
+    ) -> list[tuple[int, int, float]]:
+        """
+        Match current segments to previous by (length, color) similarity.
+        Returns list of (prev_idx, curr_idx, displacement_px).
+        """
+        if not prev_segs or not curr_segs:
+            return []
+        # compute cost matrix: color distance + length penalty
+        used_prev: set = set()
+        used_curr: set = set()
+        candidates = []
+        for ci, cs in enumerate(curr_segs):
+            cb = np.array(cs["mean_bgr"], dtype=np.float32)
+            for pi, ps in enumerate(prev_segs):
+                pb = np.array(ps["mean_bgr"], dtype=np.float32)
+                color_dist = float(np.linalg.norm(cb - pb))
+                if color_dist > max_color_dist:
+                    continue
+                lr = max(cs["length"], ps["length"]) / max(1, min(cs["length"], ps["length"]))
+                if lr > max_length_ratio:
+                    continue
+                cost = color_dist + (lr - 1.0) * 20.0
+                candidates.append((cost, pi, ci))
+        candidates.sort()
+        matches = []
+        for cost, pi, ci in candidates:
+            if pi in used_prev or ci in used_curr:
+                continue
+            disp = curr_segs[ci]["centroid_x"] - prev_segs[pi]["centroid_x"]
+            matches.append((pi, ci, disp))
+            used_prev.add(pi)
+            used_curr.add(ci)
+        return matches
+
+    def hash_velocity(
+        self,
+        band: int,
+        occ_line: np.ndarray,
+        color_line: np.ndarray,
+    ) -> tuple[Optional[list[dict]], Optional[np.ndarray]]:
+        """
+        Per-object velocity by matching (length, color) hashes across frames.
+        Returns (detections, visual).
+        """
+        self._ensure_bands(band + 1)
+        t_now = time.perf_counter()
+        curr_segs = self._segment_occ_line(occ_line, color_line)
+        prev_segs = self._prev_segments[band]
+        prev_ids = self._prev_obj_ids[band]
+        detections: list[dict] = []
+
+        # assign IDs: matched objects inherit, new ones get fresh IDs
+        curr_ids = [None] * len(curr_segs)
+        matched_ids: set = set()
+        if prev_segs is not None and prev_ids is not None and curr_segs:
+            matches = self._match_segments(prev_segs, curr_segs)
+            for pi, ci, disp in matches:
+                obj_id = prev_ids[pi]
+                curr_ids[ci] = obj_id
+                matched_ids.add(obj_id)
+        # assign new IDs to unmatched segments
+        for ci in range(len(curr_segs)):
+            if curr_ids[ci] is None:
+                curr_ids[ci] = self._next_obj_id
+                self._next_obj_id += 1
+
+        # update tracks and compute windowed velocity
+        active_ids: set = set()
+        for ci, seg in enumerate(curr_segs):
+            obj_id = curr_ids[ci]
+            active_ids.add(obj_id)
+            if obj_id not in self._obj_tracks:
+                self._obj_tracks[obj_id] = deque()
+            self._obj_band[obj_id] = band
+            track = self._obj_tracks[obj_id]
+            track.append((t_now, seg["centroid_x"]))
+            # trim to window
+            while len(track) > 1 and (t_now - track[0][0]) > self._track_window_s:
+                track.popleft()
+            # compute velocity via least-squares fit over window
+            if len(track) >= 3:
+                ts = np.array([p[0] for p in track])
+                xs = np.array([p[1] for p in track])
+                ts -= ts[0]  # shift to avoid precision issues
+                # vel = slope of best-fit line x(t)
+                n = len(ts)
+                sum_t = ts.sum()
+                sum_x = xs.sum()
+                sum_tt = (ts * ts).sum()
+                sum_tx = (ts * xs).sum()
+                denom = n * sum_tt - sum_t * sum_t
+                vel_px_s = float((n * sum_tx - sum_t * sum_x) / denom) if abs(denom) > 1e-12 else 0.0
+            elif len(track) == 2:
+                dt = track[-1][0] - track[0][0]
+                dx = track[-1][1] - track[0][1]
+                vel_px_s = dx / dt if dt > 1e-6 else 0.0
+            else:
+                vel_px_s = 0.0
+            detections.append({
+                "velocity_px_per_s": vel_px_s,
+                "mean_color_bgr": seg["mean_bgr"],
+                "centroid_x": seg["centroid_x"],
+                "length": seg["length"],
+                "obj_id": obj_id,
+            })
+
+        # prune dead tracks (only for this band)
+        dead = [k for k in self._obj_tracks
+                if self._obj_band.get(k) == band and k not in active_ids]
+        for k in dead:
+            del self._obj_tracks[k]
+            self._obj_band.pop(k, None)
+
+        self._prev_segments[band] = curr_segs
+        self._prev_obj_ids[band] = curr_ids
+
+        # build visual: two rows — prev (top) and curr (bottom)
+        W = color_line.shape[0]
+        row_h = 20
+        vis = np.full((row_h * 2 + 4, W, 3), 40, dtype=np.uint8)
+        # draw previous strip
+        if prev_segs is not None:
+            for seg in prev_segs:
+                vis[0:row_h, seg["x_start"]:seg["x_end"]] = seg["mean_bgr"]
+        # draw current strip
+        for seg in curr_segs:
+            vis[row_h + 4:row_h * 2 + 4, seg["x_start"]:seg["x_end"]] = seg["mean_bgr"]
+        # draw velocity labels on current strip
+        for det in detections:
+            cx = int(det["centroid_x"])
+            vel = det["velocity_px_per_s"]
+            color = (0, 255, 0) if abs(vel) > 5 else (0, 200, 200)
+            cv2.putText(vis, f"{vel:.0f}",
+                        (cx, row_h + 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.25, color, 1, cv2.LINE_AA)
+        return detections, vis
+
     def get_latest_sobel_visual(self, band: int) -> Optional[np.ndarray]:
         if not self._valid_band(band):
             return None
@@ -2773,6 +3001,9 @@ class VelocityEstimator:
         self._latest_hough_line_details += [None for _ in range(grow)]
         self._hough_line_history += [deque() for _ in range(grow)]
         self._persistent_line_sets += [{"pos": None, "neg": None} for _ in range(grow)]
+        self._color_rows += [deque() for _ in range(grow)]
+        self._prev_segments += [None for _ in range(grow)]
+        self._prev_obj_ids += [None for _ in range(grow)]
 
     def _get_image(self, band: int) -> Optional[np.ndarray]:
         if not self._valid_band(band) or len(self._rows[band]) == 0:
@@ -2824,6 +3055,40 @@ class VelocityEstimator:
         if orient not in ("x", "y"):
             orient = self._time_axis
         return xt.T if orient == "x" else xt
+
+    def _get_color_image_uniform_time(
+        self,
+        band: int,
+        target_hz: float,
+    ) -> Optional[np.ndarray]:
+        """Build a colored XT image: (T, W, 3) uint8, resampled to uniform time grid."""
+        if not self._valid_band(band) or len(self._color_rows[band]) == 0:
+            return None
+        rows_list = list(self._color_rows[band])
+        times_list = list(self._times[band])
+        n_color = len(rows_list)
+        n_times = len(times_list)
+        n = min(n_color, n_times)
+        if n < 2:
+            return np.stack(rows_list[:n]) if n == 1 else None
+        rows_list = rows_list[-n:]
+        ts = np.array(times_list[-n:], dtype=np.float64)
+        color_stack = np.stack(rows_list)  # (N, W, 3)
+        N, W, C = color_stack.shape
+        if target_hz <= 0.0:
+            return color_stack
+        dt = 1.0 / float(target_hz)
+        t0, t1 = float(ts[0]), float(ts[-1])
+        if t1 <= t0:
+            return color_stack
+        n_out = max(2, int(np.floor((t1 - t0) / dt)) + 1)
+        t_uni = t0 + np.arange(n_out, dtype=np.float64) * dt
+        idx = np.searchsorted(ts, t_uni, side="left")
+        idx = np.clip(idx, 0, N - 1)
+        left = np.clip(idx - 1, 0, N - 1)
+        choose_left = (idx > 0) & ((t_uni - ts[left]) <= (ts[idx] - t_uni))
+        nearest = np.where(choose_left, left, idx)
+        return color_stack[nearest, :, :]  # (n_out, W, 3)
 
     @staticmethod
     def _coerce_binary_1d(line: np.ndarray) -> np.ndarray:
@@ -2892,7 +3157,7 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     M = None
     raw_w = raw_h = None
     param = 12
-    param2 = 12.5
+    param2 = 14.5
 
     last_ts = time.perf_counter()
     USE_KALMAN = False
@@ -2937,7 +3202,6 @@ def main(capture_backend: Optional[CaptureBackend] = None,
         frame_bgr = cap.next_frame()
         last_ts = frame_start
         raw_h, raw_w = frame_bgr.shape[:2]
-
         if M is None:
             center = (raw_w // 2, raw_h // 2)
             M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
@@ -3190,6 +3454,18 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     
         push_time = time.perf_counter()
         velocity_estimator.push_occ_lines(occ_lines, t_now=push_time)
+        color_lines = GeometryAnalyzer.build_color_lines_for_bands(
+            proc_bgr, bands, lane_h, use_bottom_slice=True
+        )
+        velocity_estimator.push_color_lines(color_lines, t_now=push_time)
+        # run hash velocity on all bands, collect detections
+        _all_hash_detections: list[tuple[int, list[dict]]] = []
+        for bi in range(min(len(occ_lines), len(color_lines))):
+            dets, _ = velocity_estimator.hash_velocity(
+                band=bi, occ_line=occ_lines[bi], color_line=color_lines[bi]
+            )
+            if dets:
+                _all_hash_detections.append((bi, dets))
         planner.push_tracked_occ_lines(
             occ_lines=occ_lines, tracked_indices=tracked_indices, t_now=push_time
         )
@@ -3247,6 +3523,28 @@ def main(capture_backend: Optional[CaptureBackend] = None,
             "param2": param2
         }
         Visualizer.draw_hud(disp, hud_info)
+        # draw detected objects on game view
+        _OBJ_COLORS = [
+            (0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 255, 0), (255, 128, 0),
+            (0, 128, 255), (255, 0, 128), (128, 0, 255), (0, 255, 128),
+        ]
+        for bi, dets in _all_hash_detections:
+            if bi >= len(bands):
+                continue
+            y0, y1 = bands[bi]
+            for det in dets:
+                cx = int(det["centroid_x"])
+                half_w = det["length"] // 2
+                x1 = max(0, cx - half_w)
+                x2 = min(disp.shape[1], cx + half_w)
+                vel = det["velocity_px_per_s"]
+                obj_id = det.get("obj_id", 0)
+                color = _OBJ_COLORS[obj_id % len(_OBJ_COLORS)]
+                cv2.rectangle(disp, (x1, int(y0)), (x2, int(y1)), color, 1)
+                cv2.putText(disp, f"{vel:.0f}",
+                            (x1, int(y0) - 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.3, color, 1, cv2.LINE_AA)
         # occ_panel_now = Visualizer.make_occ_lines(
         #     occ_lines_for_display, col_scale=1, band_h=18, show_labels=True, label_w=100
         # )
