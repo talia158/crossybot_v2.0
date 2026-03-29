@@ -4,8 +4,14 @@ import numpy as np
 import json
 import time
 import mss
-import pyautogui
-import pygetwindow as gw
+try:
+    import pyautogui
+except Exception:
+    pyautogui = None
+try:
+    import pygetwindow as gw
+except ImportError:
+    gw = None
 import matplotlib
 import matplotlib.pyplot as plt
 import math
@@ -14,6 +20,14 @@ from typing import Optional, Tuple, Dict, Any, List, Deque, Sequence, Set
 from collections import defaultdict, deque
 from enum import Enum
 import argparse
+import os
+import subprocess
+import threading
+try:
+    import Quartz
+except ImportError:
+    Quartz = None
+import abc
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.ticker import FuncFormatter
 
@@ -193,6 +207,206 @@ class ScreenCapture:
     def next_frame(self) -> np.ndarray:
         img = np.array(self.sct.grab(self._monitor))
         return img[:, :, :3]
+
+class CaptureBackend(abc.ABC):
+    @abc.abstractmethod
+    def next_frame(self) -> np.ndarray:
+        """Return a BGR frame as a numpy array."""
+
+class InputBackend(abc.ABC):
+    @abc.abstractmethod
+    def press(self, key: str) -> None:
+        """Send a directional key press (up/down/left/right)."""
+
+    @abc.abstractmethod
+    def tap(self, x: int, y: int) -> None:
+        """Tap at screen coordinates."""
+
+
+class DesktopCaptureBackend(CaptureBackend):
+    def __init__(self, config: CaptureConfig):
+        self._cap = ScreenCapture(config)
+
+    def next_frame(self) -> np.ndarray:
+        return self._cap.next_frame()
+
+
+class DesktopInputBackend(InputBackend):
+    def press(self, key: str) -> None:
+        pyautogui.press(key)
+
+    def tap(self, x: int, y: int) -> None:
+        pyautogui.click(x, y)
+
+
+class AdbCaptureBackend(CaptureBackend):
+    def __init__(self, serial: Optional[str] = None,
+                 crop: Optional[Tuple[int, int, int, int]] = None):
+        self._serial = serial
+        self._adb_prefix = ["adb"]
+        if serial:
+            self._adb_prefix = ["adb", "-s", serial]
+        self._crop = crop  # (x, y, w, h) or None
+
+    def next_frame(self) -> np.ndarray:
+        cmd = self._adb_prefix + ["exec-out", "screencap", "-p"]
+        result = subprocess.run(cmd, capture_output=True, timeout=5)
+        if result.returncode != 0:
+            raise RuntimeError(f"adb screencap failed: {result.stderr.decode(errors='replace')}")
+        png_bytes = result.stdout
+        arr = np.frombuffer(png_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError("Failed to decode screencap PNG from adb")
+        if self._crop is not None:
+            x, y, w, h = self._crop
+            ih, iw = img.shape[:2]
+            x, y = max(0, x), max(0, y)
+            w = min(w, iw - x)
+            h = min(h, ih - y)
+            if w > 0 and h > 0:
+                img = img[y:y+h, x:x+w]
+        return img
+
+
+class PipeCaptureBackend(CaptureBackend):
+    """
+    Streams frames from the device via screenrecord H264 → OpenCV VideoCapture.
+    A background thread reads continuously; next_frame() returns the latest.
+    Designed for Docker/Linux. Achieves 60–90 FPS at 270x480.
+    """
+    _FIFO_PATH = "/tmp/crossybot_screen.h264"
+
+    def __init__(self, serial: Optional[str] = None,
+                 crop: Optional[Tuple[int, int, int, int]] = None):
+        self._serial = serial
+        self._crop = crop
+        self._adb_prefix = ["adb"] + (["-s", serial] if serial else [])
+        self._latest_frame: Optional[np.ndarray] = None
+        self._frame_lock = threading.Lock()
+        self._frame_ready = threading.Event()
+        self._running = True
+        self._start_pipeline()
+        self._reader = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader.start()
+
+    def _start_pipeline(self) -> None:
+        fifo = self._FIFO_PATH
+        if os.path.exists(fifo):
+            os.unlink(fifo)
+        os.mkfifo(fifo)
+
+        # screenrecord writes raw H264 to the FIFO
+        def _writer():
+            with open(fifo, "wb") as f:
+                self._adb_proc = subprocess.Popen(
+                    self._adb_prefix + [
+                        "exec-out", "screenrecord", "--output-format=h264", "/dev/stdout",
+                    ],
+                    stdout=f, stderr=subprocess.DEVNULL,
+                )
+                self._adb_proc.wait()
+        self._writer_thread = threading.Thread(target=_writer, daemon=True)
+        self._writer_thread.start()
+
+        # OpenCV reads from the FIFO using its built-in ffmpeg decoder
+        self._cap = cv2.VideoCapture(fifo)
+
+    def _reader_loop(self) -> None:
+        while self._running:
+            ret, frame = self._cap.read()
+            if not ret:
+                # screenrecord hit 3-min limit — restart
+                self._cap.release()
+                self._start_pipeline()
+                continue
+            with self._frame_lock:
+                self._latest_frame = frame
+            self._frame_ready.set()
+
+    def next_frame(self) -> np.ndarray:
+        self._frame_ready.wait()  # only blocks until first frame arrives
+        with self._frame_lock:
+            img = self._latest_frame
+        if self._crop is not None:
+            x, y, w, h = self._crop
+            img = img[y:y+h, x:x+w]
+        return img
+
+    def __del__(self) -> None:
+        self._running = False
+        if hasattr(self, "_cap"):
+            self._cap.release()
+        proc = getattr(self, "_adb_proc", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+        fifo = self._FIFO_PATH
+        if os.path.exists(fifo):
+            os.unlink(fifo)
+
+
+class AdbInputBackend(InputBackend):
+    _FALLBACK_W = 1080
+    _FALLBACK_H = 1920
+
+    def __init__(self, serial: Optional[str] = None):
+        self._serial = serial
+        self._adb_prefix = ["adb"]
+        if serial:
+            self._adb_prefix = ["adb", "-s", serial]
+        self._dev_w, self._dev_h = self._query_screen_size()
+        self._children: List[subprocess.Popen] = []
+
+    def _query_screen_size(self) -> Tuple[int, int]:
+        try:
+            cmd = self._adb_prefix + ["shell", "wm", "size"]
+            result = subprocess.run(cmd, capture_output=True, timeout=5, text=True)
+            for line in result.stdout.strip().splitlines():
+                if "x" in line:
+                    parts = line.split()[-1]  # e.g. "1080x1920"
+                    w, h = parts.split("x")
+                    return int(w), int(h)
+        except Exception:
+            pass
+        return self._FALLBACK_W, self._FALLBACK_H
+
+    def _rel(self, frac_x: float, frac_y: float) -> Tuple[int, int]:
+        return int(frac_x * self._dev_w), int(frac_y * self._dev_h)
+
+    def _build_key_map(self) -> dict:
+        cx, cy = self._rel(0.5, 0.42)
+        _, dy = self._rel(0.0, 0.10)
+        dx, _ = self._rel(0.19, 0.0)
+        return {
+            "up": f"swipe {cx} {cy} {cx} {cy - dy} 80",
+            "down": f"swipe {cx} {cy} {cx} {cy + dy} 80",
+            "left": f"swipe {cx} {cy} {cx - dx} {cy} 80",
+            "right": f"swipe {cx} {cy} {cx + dx} {cy} 80",
+        }
+
+    def _reap_children(self) -> None:
+        alive = []
+        for p in self._children:
+            if p.poll() is None:
+                alive.append(p)
+        self._children = alive
+
+    def _run(self, shell_cmd: str) -> None:
+        self._reap_children()
+        cmd = self._adb_prefix + ["shell", "input"] + shell_cmd.split()
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._children.append(proc)
+
+    def press(self, key: str) -> None:
+        key_map = self._build_key_map()
+        shell_cmd = key_map.get(key)
+        if shell_cmd is None:
+            shell_cmd = f"keyevent {key}"
+        self._run(shell_cmd)
+
+    def tap(self, x: int, y: int) -> None:
+        self._run(f"tap {x} {y}")
+
 
 class Visualizer:
     @staticmethod
@@ -1322,8 +1536,9 @@ class GameOverDetector:
         return self.triggered, float(frac)
 
 class BotStateMachine:
-    def __init__(self, wait_time: float = 0.5):
+    def __init__(self, wait_time: float = 0.5, input_backend: Optional[InputBackend] = None):
         self.wait_time = float(wait_time)
+        self._input = input_backend or DesktopInputBackend()
         self.reset()
 
     def reset(self):
@@ -1333,7 +1548,7 @@ class BotStateMachine:
     def update(self, *, move_cmd: str):
         now = time.perf_counter()
         if self.state == "start":
-            pyautogui.press('up')
+            self._input.press('up')
             self.state = "moving"
             self.last_change = now
         elif self.state == "moving":
@@ -1342,7 +1557,7 @@ class BotStateMachine:
                 self.last_change = now
         elif self.state == "static":
             if move_cmd and move_cmd != 'wait':
-                pyautogui.press(move_cmd)
+                self._input.press(move_cmd)
                 self.state = "moving"
                 self.last_change = now
 
@@ -2636,7 +2851,12 @@ class VelocityEstimator:
         return 0 <= band < len(self._rows)
 
 
-def main():
+def main(capture_backend: Optional[CaptureBackend] = None,
+         input_backend: Optional[InputBackend] = None,
+         target_fps: int = 120,
+         is_desktop: bool = True,
+         show_display: bool = True,
+         display_fps: int = 60):
     MOVE_VY_THRESH = 0.40
     PHASE_BLEND = 0.85
     PHASE_EMA = 0.20
@@ -2647,12 +2867,21 @@ def main():
     SHOW_CHAR_DEBUG = False
     CHAR_DEBUG_WIN = "Character Debug"
     offset_log: list[dict] = []
-    angle_deg = 14.5
+    angle_deg = 14.5 if is_desktop else 0.0
     SHOW_PLANNER_VIZ = True
-    cfg = CaptureConfig(monitor=1, region=(0, 27, 247, 449))
-    cap = ScreenCapture(cfg)
-    target_fps = 120
+    if capture_backend is None:
+        cfg = CaptureConfig(monitor=1, region=(0, 27, 247, 449))
+        capture_backend = DesktopCaptureBackend(cfg)
+    if input_backend is None:
+        input_backend = DesktopInputBackend()
+    cap = capture_backend
+    if target_fps <= 0:
+        raise ValueError("target_fps must be positive")
     target_dt = 1.0 / target_fps
+    _display_dt = 1.0 / display_fps if display_fps > 0 else 0.0
+    _last_display_ts = 0.0
+    _windows_positioned = False
+    _windows_created = False
     vertical_fraction = 0.6
     offset = 0
     last_moving = None
@@ -2663,7 +2892,7 @@ def main():
     M = None
     raw_w = raw_h = None
     param = 12
-    param2 = 14.5
+    param2 = 14.5 if is_desktop else 0.0
     last_ts = time.perf_counter()
     USE_KALMAN = False
     gameover = GameOverDetector(
@@ -2672,7 +2901,7 @@ def main():
         min_frac=0.015,
         consec_needed=3,
     )
-    state_machine = BotStateMachine(wait_time=0.2)
+    state_machine = BotStateMachine(wait_time=0.2, input_backend=input_backend)
     hlines = None
     if not hasattr(main, "_last_offset0"):
         main._last_offset0 = None
@@ -2702,6 +2931,8 @@ def main():
         frame_start = time.perf_counter()
         dt = max(1e-6, frame_start - last_ts)
         inst_fps = 1.0 / dt
+        # Rate-limit display updates so X11 over TCP doesn't choke
+        _should_display = show_display and (frame_start - _last_display_ts >= _display_dt)
         frame_bgr = cap.next_frame()
         last_ts = frame_start
         raw_h, raw_w = frame_bgr.shape[:2]
@@ -2731,9 +2962,10 @@ def main():
         )
         triggered, go_frac = gameover.update(proc_bgr)
         if triggered:
-            _wins = gw.getWindowsWithTitle("MSI App Player")
-            win = _wins[0] if _wins else None
-            # pyautogui.click(150, 430)
+            if is_desktop:
+                if gw is not None:
+                    _wins = gw.getWindowsWithTitle("MSI App Player")
+                    win = _wins[0] if _wins else None
             print("GAME OVER")
             band_class_store = []
             tracked_indices = [i for i in range(11, 15)]
@@ -2743,9 +2975,8 @@ def main():
         center, bbox, score, dbg = CharacterTools.detect_character(
             proc_bgr, bgr_target=(92, 172, 255), tol=4, debug=True
         )
-        if SHOW_CHAR_DEBUG and dbg is not None and "montage" in dbg:
+        if _should_display and SHOW_CHAR_DEBUG and dbg is not None and "montage" in dbg:
             cv2.imshow(CHAR_DEBUG_WIN, dbg["montage"])
-            cv2.moveWindow(CHAR_DEBUG_WIN, 760, 0)
         hsv = cv2.cvtColor(proc_bgr, cv2.COLOR_BGR2HSV)
         lab = cv2.cvtColor(proc_bgr, cv2.COLOR_BGR2Lab)
         _, gray_den = DensityMaskUtils.gray_density_map_hsv_from(hsv, lab, ksize=11)
@@ -2979,13 +3210,7 @@ def main():
             else:
                 hough_visual_dims_11_15.append(None)
             segment_infos.append(segment_info)
-            if hough_vis is not None:
-                cv2.namedWindow("Velocity XT HoughP" + str(idx), cv2.WINDOW_NORMAL)
-                cv2.imshow("Velocity XT HoughP" + str(idx), hough_vis)
             sobel_vis = velocity_estimator.get_latest_sobel_visual(idx)
-            if sobel_vis is not None:
-                cv2.namedWindow("Velocity XT Sobel" + str(idx), cv2.WINDOW_NORMAL)
-                cv2.imshow("Velocity XT Sobel" + str(idx), sobel_vis)
             # actual_hough_vis = velocity_estimator.get_latest_actual_hough_visual(param)
             # if actual_hough_vis is not None:
             #     cv2.namedWindow("Velocity XT HoughP Actual", cv2.WINDOW_NORMAL)
@@ -2999,14 +3224,15 @@ def main():
             future_time_s=VELOCITY_FUTURE_PROJECTION_S,
             visualize=True,
         )
-        for idx, proj_vis in enumerate(proj_vis_list):
-            win_name = f"SP Band {idx}"
-            if proj_vis is None:
-                continue
-            if win_name not in projection_windows:
-                projection_windows.add(win_name)
-                cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-            cv2.imshow(win_name, proj_vis)
+        if False and _should_display:
+            for idx, proj_vis in enumerate(proj_vis_list):
+                win_name = f"SP Band {idx}"
+                if proj_vis is None:
+                    continue
+                if win_name not in projection_windows:
+                    projection_windows.add(win_name)
+                    cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
+                cv2.imshow(win_name, proj_vis)
 
         # move_cmd = planner.plan_move()
         move_cmd = 'wait'
@@ -3025,16 +3251,20 @@ def main():
         occ_panel_now = Visualizer.make_occ_lines(
             occ_lines, col_scale=1, band_h=18, show_labels=True, label_w=100
         )
-        cv2.imshow("occ_lines NOW (0=free,1=occ)", occ_panel_now)
-        cv2.moveWindow("occ_lines NOW (0=free,1=occ)", 760, 0)
-                                                                                                                                                         
         main._prev_occ_lines = [l.copy() if l is not None else None for l in occ_lines]
-        cv2.imshow("CrossyBot", disp)
-        cv2.moveWindow("CrossyBot", 650, 0)
-        key = cv2.waitKey(1) & 0xFF
-        if key == 27 or key == ord("q"):
-            cv2.destroyAllWindows()
-            return
+        if _should_display:
+            _last_display_ts = frame_start
+            if not _windows_created:
+                cv2.namedWindow("CrossyBot", cv2.WINDOW_NORMAL)
+                _windows_created = True
+            cv2.imshow("CrossyBot", disp)
+            if not _windows_positioned:
+                cv2.moveWindow("CrossyBot", 650, 0)
+                _windows_positioned = True
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27 or key == ord("q"):
+                cv2.destroyAllWindows()
+                return
         if key == ord("]"):
             param += 1
             # param2 += 0.1
@@ -3050,12 +3280,43 @@ def main():
 
 def _parse_runtime_args():
     parser = argparse.ArgumentParser(description="CrossyBot runner")
-    return parser.parse_args()
+    parser.add_argument(
+        "--backend", choices=["desktop", "adb", "pipe"], default="desktop",
+        help="Capture/input backend (default: desktop)",
+    )
+    parser.add_argument(
+        "--serial", default=None,
+        help="ADB device serial (passed to adb -s). Only used with --backend adb.",
+    )
+    parser.add_argument(
+        "--fps", type=int, default=120,
+        help="Target FPS for the main loop (default: 120)",
+    )
+    parser.add_argument(
+        "--crop", type=int, nargs=4, metavar=("X", "Y", "W", "H"), default=None,
+        help="Crop region (x y w h) applied to ADB captures. Ignored in desktop mode.",
+    )
+    parser.add_argument(
+        "--no-display", action="store_true", default=False,
+        help="Disable all cv2 debug windows (faster — no macOS Cocoa overhead).",
+    )
+    args = parser.parse_args()
+    if args.fps <= 0:
+        parser.error("--fps must be a positive integer")
+    return args
 
-def _configure_runtime(args) -> None:
-    del args  # currently unused; placeholder for future runtime switches
+def _build_backends(args) -> Tuple[CaptureBackend, InputBackend]:
+    crop = tuple(args.crop) if args.crop else None
+    if args.backend == "adb":
+        return AdbCaptureBackend(serial=args.serial, crop=crop), AdbInputBackend(serial=args.serial)
+    if args.backend == "pipe":
+        return PipeCaptureBackend(serial=args.serial, crop=crop), AdbInputBackend(serial=args.serial)
+    return DesktopCaptureBackend(CaptureConfig(monitor=1, region=(0, 27, 247, 449))), DesktopInputBackend()
 
 if __name__ == "__main__":
     args = _parse_runtime_args()
-    _configure_runtime(args)
-    main()
+    _capture, _input = _build_backends(args)
+    main(capture_backend=_capture, input_backend=_input, target_fps=args.fps,
+         is_desktop=(args.backend == "desktop"),
+         show_display=not args.no_display,
+    )
