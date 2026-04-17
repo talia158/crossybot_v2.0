@@ -20,6 +20,7 @@ from typing import Optional, Tuple, Dict, Any, List, Deque, Sequence, Set
 from collections import defaultdict, deque
 from enum import Enum
 import argparse
+import base64
 import os
 import subprocess
 import threading
@@ -129,6 +130,14 @@ BAND_COV_SAMPLE_FRAC = 1.0
 BAND_AGREEMENT_THRESH = 0.95
 OFFSET_SEARCH_RADIUS = 5
 VELOCITY_WINDOW_S = 2.0
+# Kalman filter tuning — per-object constant-velocity tracker in VelocityEstimator
+_KF_Q_POS = 1.0          # process noise for edge position (px²/s)
+_KF_Q_VEL = 2000.0       # process noise for velocity (px²/s³) — high so the filter tracks fast; matcher identity swaps happen frequently and coasting amplifies the resulting spike
+_KF_R = 4.0              # measurement noise per edge (px²)
+_KF_GATE_CHI2 = 25.0     # Mahalanobis² rejection threshold (~5σ, 2-DOF) — merge detector carries most of the overlap rejection; Mahalanobis only guards catastrophic swaps
+_KF_MAX_GATED_FRAMES = 6 # force-accept after this many consecutive gated frames
+_KF_MERGE_LEN_RATIO = 1.6  # blob length vs. tracked length triggers merge flag
+_KF_MERGE_OVERLAP_FRAC = 0.30  # predicted span overlap fraction triggers merge flag
 K3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 cv2.useOptimized()
 matplotlib.use("Agg")
@@ -1598,6 +1607,48 @@ class Planner:
         return "up"
 
 
+class FrameLogger:
+    """
+    Per-frame JSONL writer for offline replay. Captures the raw per-band
+    occupancy + color lines fed into VelocityEstimator.hash_velocity, plus
+    the frame timestamp. Output format: one JSON object per line:
+      {"t": float, "bands": [{"occ": {b64,shape,dtype},
+                              "color": {b64,shape,dtype}}, ...]}
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.f = open(path, "w", buffering=1)  # line-buffered
+        self.frames_written = 0
+
+    @staticmethod
+    def _encode(arr: np.ndarray) -> dict:
+        arr = np.ascontiguousarray(arr)
+        return {
+            "b64": base64.b64encode(arr.tobytes()).decode("ascii"),
+            "shape": list(arr.shape),
+            "dtype": str(arr.dtype),
+        }
+
+    @staticmethod
+    def decode(d: dict) -> np.ndarray:
+        return np.frombuffer(
+            base64.b64decode(d["b64"]), dtype=np.dtype(d["dtype"])
+        ).reshape(d["shape"])
+
+    def log_frame(self, t: float, occ_lines: list, color_lines: list) -> None:
+        bands = []
+        for occ, col in zip(occ_lines, color_lines):
+            bands.append({
+                "occ": self._encode(np.asarray(occ, dtype=np.uint8)),
+                "color": self._encode(np.asarray(col, dtype=np.uint8)),
+            })
+        self.f.write(json.dumps({"t": float(t), "bands": bands}) + "\n")
+        self.frames_written += 1
+
+    def close(self) -> None:
+        if self.f and not self.f.closed:
+            self.f.close()
 
 
 class VelocityEstimator:
@@ -1642,7 +1693,10 @@ class VelocityEstimator:
         self._next_obj_id: int = 0
         self._obj_tracks: dict[int, Deque[tuple[float, float]]] = {}  # obj_id → deque of (time, centroid_x)
         self._obj_band: dict[int, int] = {}  # obj_id → band index
+        self._obj_tracked_edge: dict[int, str] = {}  # obj_id → "left"/"right"/"both"
         self._track_window_s: float = 0.5  # time window for velocity averaging
+        self._obj_kalman: dict[int, dict] = {}  # obj_id → {x, P, last_t, length_ema, gated_count, last_gated}
+        self._kf_debug: bool = False  # enable to print per-frame gated-frame telemetry
 
     def push_occ_lines(self, occ_lines: List[np.ndarray], t_now: float) -> None:
         self._ensure_bands(len(occ_lines))
@@ -1771,19 +1825,82 @@ class VelocityEstimator:
             })
         return segments
 
+
+
     @staticmethod
-    def _lsq_slope(ts: np.ndarray, xs: np.ndarray) -> float:
-        """Least-squares slope (velocity) of xs over ts."""
-        if len(ts) < 2:
-            return 0.0
-        t = ts - ts[0]
-        n = len(t)
-        st = t.sum()
-        sx = xs.sum()
-        stt = (t * t).sum()
-        stx = (t * xs).sum()
-        denom = n * stt - st * st
-        return float((n * stx - st * sx) / denom) if abs(denom) > 1e-12 else 0.0
+    def _kf_init(x_start: float, x_end: float, t_now: float) -> dict:
+        """Create a Kalman filter state for a newly tracked object."""
+        return {
+            "x": np.array([float(x_start), float(x_end), 0.0], dtype=np.float64),
+            "P": np.diag([100.0, 100.0, 400.0]).astype(np.float64),
+            "last_t": float(t_now),
+            "last_update_t": float(t_now),
+            "length_ema": float(x_end - x_start),
+            "gated_count": 0,
+            "last_gated": False,
+        }
+
+    @staticmethod
+    def _kf_predict(kf: dict, t_now: float) -> tuple[np.ndarray, np.ndarray, float]:
+        """Advance state to t_now in place. Returns (x_pred, P_pred, dt)."""
+        dt = max(1e-4, float(t_now) - kf["last_t"])
+        F = np.array([[1.0, 0.0, dt],
+                      [0.0, 1.0, dt],
+                      [0.0, 0.0, 1.0]], dtype=np.float64)
+        Q = np.diag([_KF_Q_POS * dt, _KF_Q_POS * dt, _KF_Q_VEL * dt]).astype(np.float64)
+        kf["x"] = F @ kf["x"]
+        kf["P"] = F @ kf["P"] @ F.T + Q
+        kf["last_t"] = float(t_now)
+        return kf["x"], kf["P"], dt
+
+    @staticmethod
+    def _kf_update(kf: dict, z: np.ndarray, H: np.ndarray, R: np.ndarray) -> None:
+        """
+        Measurement update with arbitrary H/R. Shapes: z(k,), H(k,3), R(k,k).
+        Caller must have already called _kf_predict this frame, and must have
+        run its own gating — this method unconditionally applies the update.
+        """
+        y = z - H @ kf["x"]
+        S = H @ kf["P"] @ H.T + R
+        S_inv = np.linalg.inv(S)
+        K = kf["P"] @ H.T @ S_inv
+        kf["x"] = kf["x"] + K @ y
+        kf["P"] = (np.eye(3) - K @ H) @ kf["P"]
+
+    @staticmethod
+    def _kf_detect_merge(
+        obj_id: int,
+        seg_length: float,
+        seg_span: tuple[float, float],
+        kf_self: dict,
+        others: dict,
+        band: int,
+        obj_band: dict,
+        skip_length_check: bool = False,
+    ) -> bool:
+        """
+        Fire merge flag if either:
+          - seg_length > 1.6 * tracked length EMA (suppressed during entry/exit
+            when skip_length_check=True, since length grows organically), OR
+          - another active obj_id's predicted span overlaps the current blob by
+            ≥30% of the shorter object's length (car-meets-tree signal).
+        """
+        if (not skip_length_check
+                and kf_self["length_ema"] > 0
+                and seg_length > _KF_MERGE_LEN_RATIO * kf_self["length_ema"]):
+            return True
+        blob_l, blob_r = seg_span
+        for other_id, kf_other in others.items():
+            if other_id == obj_id:
+                continue
+            if obj_band.get(other_id) != band:
+                continue
+            ol, orr = float(kf_other["x"][0]), float(kf_other["x"][1])
+            overlap = max(0.0, min(blob_r, orr) - max(blob_l, ol))
+            shorter = min(max(1.0, blob_r - blob_l), max(1.0, orr - ol))
+            if overlap / shorter >= _KF_MERGE_OVERLAP_FRAC:
+                return True
+        return False
 
     @staticmethod
     def _match_segments(
@@ -1830,14 +1947,19 @@ class VelocityEstimator:
         band: int,
         occ_line: np.ndarray,
         color_line: np.ndarray,
+        t_now: Optional[float] = None,
     ) -> tuple[Optional[list[dict]], Optional[np.ndarray]]:
         """
         Per-object velocity by matching (length, color) hashes across frames.
+        Pass `t_now` explicitly for deterministic offline replay; otherwise
+        the wall clock is used.
         Returns (detections, visual).
         """
         self._ensure_bands(band + 1)
-        t_now = time.perf_counter()
+        if t_now is None:
+            t_now = time.perf_counter()
         curr_segs = self._segment_occ_line(occ_line, color_line)
+
         prev_segs = self._prev_segments[band]
         prev_ids = self._prev_obj_ids[band]
         detections: list[dict] = []
@@ -1857,70 +1979,185 @@ class VelocityEstimator:
                 curr_ids[ci] = self._next_obj_id
                 self._next_obj_id += 1
 
-        # update tracks and compute windowed velocity
+        # Phase 1: predict every existing Kalman for this band forward to t_now.
+        # Predicted spans are used by the merge detector before any update runs.
+        for oid, kf in self._obj_kalman.items():
+            if self._obj_band.get(oid) == band:
+                self._kf_predict(kf, t_now)
+
+        # Phase 2: update trackers. Matching is unchanged; Kalman smooths state.
         active_ids: set = set()
+        W = occ_line.shape[0]
         for ci, seg in enumerate(curr_segs):
             obj_id = curr_ids[ci]
             active_ids.add(obj_id)
+            self._obj_band[obj_id] = band
             if obj_id not in self._obj_tracks:
                 self._obj_tracks[obj_id] = deque()
-            self._obj_band[obj_id] = band
             track = self._obj_tracks[obj_id]
             track.append((t_now, float(seg["x_start"]), float(seg["x_end"])))
-            # trim to window
             while len(track) > 1 and (t_now - track[0][0]) > self._track_window_s:
                 track.popleft()
-            # compute velocity — use non-stationary edge when one is clamped
-            vel_px_s = 0.0
-            if len(track) >= 2:
-                W = occ_line.shape[0]
-                ts = np.array([p[0] for p in track])
-                lefts = np.array([p[1] for p in track])
-                rights = np.array([p[2] for p in track])
-                left_var = np.var(lefts)
-                right_var = np.var(rights)
-                edge_var_thresh = 5.0  # px² — near-stationary edge
-                near_boundary = 5  # px from screen edge
-                left_clamped = left_var < edge_var_thresh and lefts.mean() < near_boundary
-                right_clamped = right_var < edge_var_thresh and rights.mean() > W - near_boundary
-                # pick the edge(s) to use for velocity
-                if left_clamped and not right_clamped:
-                    xs = rights  # left stuck at boundary, use right edge
-                elif right_clamped and not left_clamped:
-                    xs = lefts   # right stuck at boundary, use left edge
+
+            # init filter on first sight (already predicted above if pre-existing)
+            if obj_id not in self._obj_kalman:
+                self._obj_kalman[obj_id] = self._kf_init(seg["x_start"], seg["x_end"], t_now)
+            kf = self._obj_kalman[obj_id]
+
+            # Clamp detection — an edge pinned to the screen boundary with near-zero
+            # variance is not a real measurement (object is entering/exiting). Drop
+            # that edge from the measurement and freeze length_ema.
+            near_boundary = 5
+            edge_var_thresh = 5.0
+            left_clamped = right_clamped = False
+            if len(track) >= 3:
+                lefts_hist = np.array([p[1] for p in track])
+                rights_hist = np.array([p[2] for p in track])
+                left_clamped = (np.var(lefts_hist) < edge_var_thresh
+                                and lefts_hist.mean() < near_boundary)
+                right_clamped = (np.var(rights_hist) < edge_var_thresh
+                                 and rights_hist.mean() > W - near_boundary)
+
+            # Build measurement matrix based on which edges are observable
+            if left_clamped and not right_clamped:
+                z = np.array([float(seg["x_end"])], dtype=np.float64)
+                H = np.array([[0.0, 1.0, 0.0]], dtype=np.float64)
+                R_mat = np.array([[_KF_R]], dtype=np.float64)
+                pred_edges = np.array([kf["x"][1]])
+            elif right_clamped and not left_clamped:
+                z = np.array([float(seg["x_start"])], dtype=np.float64)
+                H = np.array([[1.0, 0.0, 0.0]], dtype=np.float64)
+                R_mat = np.array([[_KF_R]], dtype=np.float64)
+                pred_edges = np.array([kf["x"][0]])
+            else:
+                z = np.array([float(seg["x_start"]), float(seg["x_end"])], dtype=np.float64)
+                H = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+                R_mat = np.diag([_KF_R, _KF_R])
+                pred_edges = np.array([kf["x"][0], kf["x"][1]])
+            y_innov = z - pred_edges
+            dt_since = max(1e-4, t_now - kf.get("last_update_t", t_now))
+            clamp_active = left_clamped or right_clamped
+
+            # Gate 1: merge detector (length check suppressed while clamped — length
+            # grows naturally during entry so that signal is unreliable)
+            merge_flag = self._kf_detect_merge(
+                obj_id, float(seg["length"]),
+                (float(seg["x_start"]), float(seg["x_end"])),
+                kf, self._obj_kalman, band, self._obj_band,
+                skip_length_check=clamp_active,
+            )
+            # Gate 2: velocity-consistency on whichever edges we observe
+            expected_jump = abs(kf["x"][2]) * dt_since + 8.0
+            velocity_gate = bool((np.abs(y_innov) > 3.0 * expected_jump).any())
+            # Gate 3: Mahalanobis (safe for 1D or 2D measurement)
+            S = H @ kf["P"] @ H.T + R_mat
+            try:
+                d2 = float(y_innov @ np.linalg.inv(S) @ y_innov)
+            except np.linalg.LinAlgError:
+                d2 = float("inf")
+            maha_gate = d2 > _KF_GATE_CHI2
+
+            force_accept = kf["gated_count"] >= _KF_MAX_GATED_FRAMES
+            gated = (merge_flag or velocity_gate or maha_gate) and not force_accept
+
+            if not gated:
+                self._kf_update(kf, z, H, R_mat)
+                kf["gated_count"] = 0
+                kf["last_update_t"] = t_now
+                # Freeze length_ema while clamped — raw length isn't the true length
+                if not clamp_active:
+                    kf["length_ema"] = 0.7 * kf["length_ema"] + 0.3 * float(seg["length"])
+            else:
+                kf["gated_count"] += 1
+                if getattr(self, "_kf_debug", False):
+                    print(f"[KF] gated obj={obj_id} band={band} "
+                          f"raw=[{seg['x_start']},{seg['x_end']}] "
+                          f"pred=[{kf['x'][0]:.1f},{kf['x'][1]:.1f}] "
+                          f"d²={d2:.2f} merge={merge_flag} vgate={velocity_gate} "
+                          f"clamp=L{int(left_clamped)}R{int(right_clamped)}")
+            kf["last_gated"] = gated
+
+            # tracked_edge metadata for downstream consumers (reuses clamp detection)
+            if left_clamped and not right_clamped:
+                tracked_edge = "right"
+            elif right_clamped and not left_clamped:
+                tracked_edge = "left"
+            else:
+                prev_edge = self._obj_tracked_edge.get(obj_id, "both")
+                v = float(kf["x"][2])
+                if v < -5.0:
+                    tracked_edge = "left"
+                elif v > 5.0:
+                    tracked_edge = "right"
                 else:
-                    xs = (lefts + rights) / 2.0  # centroid
-                vel_px_s = self._lsq_slope(ts, xs)
+                    tracked_edge = prev_edge
+            self._obj_tracked_edge[obj_id] = tracked_edge
+
+            kf_cx = float((kf["x"][0] + kf["x"][1]) / 2.0)
+            kf_len = int(round(max(0.0, kf["x"][1] - kf["x"][0])))
             detections.append({
-                "velocity_px_per_s": vel_px_s,
+                "velocity_px_per_s": float(kf["x"][2]),
                 "mean_color_bgr": seg["mean_bgr"],
-                "centroid_x": seg["centroid_x"],
-                "length": seg["length"],
+                "centroid_x": kf_cx,
+                "length": kf_len,
                 "obj_id": obj_id,
+                "tracked_edge": tracked_edge,
+                "gated": gated,
             })
 
-        # prune dead tracks (only for this band)
-        dead = [k for k in self._obj_tracks
-                if self._obj_band.get(k) == band and k not in active_ids]
+        # Phase 3: synthetic detections for Kalman-tracked objects absent from this frame
+        # (e.g. fully absorbed into a merged blob assigned to another obj_id).
+        synthetic_dets: list[dict] = []
+        for oid, kf in self._obj_kalman.items():
+            if self._obj_band.get(oid) != band or oid in active_ids:
+                continue
+            kf_cx = float((kf["x"][0] + kf["x"][1]) / 2.0)
+            kf_len = int(round(max(0.0, kf["x"][1] - kf["x"][0])))
+            synthetic_dets.append({
+                "velocity_px_per_s": float(kf["x"][2]),
+                "mean_color_bgr": (0, 0, 0),
+                "centroid_x": kf_cx,
+                "length": kf_len,
+                "obj_id": oid,
+                "tracked_edge": self._obj_tracked_edge.get(oid, "both"),
+                "predicted": True,
+                "gated": kf.get("last_gated", False),
+            })
+
+        # prune dead tracks: only when a filter has not been observed for longer than
+        # the track window (gives filters time to coast through occlusions)
+        dead = [k for k, kf in self._obj_kalman.items()
+                if t_now - kf["last_t"] > self._track_window_s
+                or (self._obj_band.get(k) == band and k not in active_ids
+                    and len(self._obj_tracks.get(k, ())) > 0
+                    and t_now - self._obj_tracks[k][-1][0] > self._track_window_s)]
         for k in dead:
-            del self._obj_tracks[k]
+            self._obj_tracks.pop(k, None)
             self._obj_band.pop(k, None)
+            self._obj_tracked_edge.pop(k, None)
+            self._obj_kalman.pop(k, None)
 
         self._prev_segments[band] = curr_segs
         self._prev_obj_ids[band] = curr_ids
 
-        # build visual: two rows — prev (top) and curr (bottom)
+        # build visual: two rows — prev (top) and curr (bottom) with Kalman overlay
         W = color_line.shape[0]
         row_h = 20
         vis = np.full((row_h * 2 + 4, W, 3), 40, dtype=np.uint8)
-        # draw previous strip
         if prev_segs is not None:
             for seg in prev_segs:
                 vis[0:row_h, seg["x_start"]:seg["x_end"]] = seg["mean_bgr"]
-        # draw current strip
         for seg in curr_segs:
             vis[row_h + 4:row_h * 2 + 4, seg["x_start"]:seg["x_end"]] = seg["mean_bgr"]
-        # draw velocity labels on current strip
+        # Kalman predicted span overlay (magenta, 2px tall) on the current strip
+        for oid, kf in self._obj_kalman.items():
+            if self._obj_band.get(oid) != band:
+                continue
+            kl = max(0, min(W - 1, int(round(kf["x"][0]))))
+            kr = max(0, min(W - 1, int(round(kf["x"][1]))))
+            if kr > kl:
+                vis[row_h + 4:row_h + 6, kl:kr] = (255, 0, 255)
+        # velocity labels + "G" when gated
         for det in detections:
             cx = int(det["centroid_x"])
             vel = det["velocity_px_per_s"]
@@ -1928,7 +2165,11 @@ class VelocityEstimator:
             cv2.putText(vis, f"{vel:.0f}",
                         (cx, row_h + 2), cv2.FONT_HERSHEY_SIMPLEX,
                         0.25, color, 1, cv2.LINE_AA)
-        return detections, vis
+            if det.get("gated"):
+                cv2.putText(vis, "G",
+                            (cx, row_h * 2 + 2), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.25, (255, 0, 255), 1, cv2.LINE_AA)
+        return detections + synthetic_dets, vis
 
     def _ensure_bands(self, n: int) -> None:
         grow = n - len(self._rows)
@@ -2058,7 +2299,8 @@ def main(capture_backend: Optional[CaptureBackend] = None,
          target_fps: int = 120,
          is_desktop: bool = True,
          show_display: bool = True,
-         display_fps: int = 60):
+         display_fps: int = 60,
+         log_frames_path: Optional[str] = None):
     MOVE_VY_THRESH = 0.40
     PHASE_BLEND = 0.85
     PHASE_EMA = 0.20
@@ -2071,6 +2313,10 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     offset_log: list[dict] = []
     angle_deg = 14.5
     SHOW_PLANNER_VIZ = True
+    frame_logger: Optional[FrameLogger] = None
+    if log_frames_path:
+        frame_logger = FrameLogger(log_frames_path)
+        print(f"[main] Logging raw frames to {log_frames_path}")
     if capture_backend is None:
         cfg = CaptureConfig(monitor=1, region=(0, 27, 247, 449))
         capture_backend = DesktopCaptureBackend(cfg)
@@ -2118,6 +2364,8 @@ def main(capture_backend: Optional[CaptureBackend] = None,
     last_offset_sign = -1
     if not hasattr(main, "_prev_occ_lines"):
         main._prev_occ_lines = None
+    if not hasattr(main, "_obj_flash"):
+        main._obj_flash: dict[int, int] = {}  # obj_id → frames remaining
     velocity_estimator = VelocityEstimator(
         window_s=VELOCITY_WINDOW_S,
         time_on_x=True,
@@ -2293,51 +2541,8 @@ def main(capture_backend: Optional[CaptureBackend] = None,
             y1 = int(np.clip(center[1] + half_side, y0_bound, y1_bound))
             cv2.rectangle(disp, (x0, y0), (x1, y1), (0, 255, 255), 1)
             character_rect_x = (x0, x1)
-        cx, cy = w * 0.5, h * 0.5
-        theta = math.radians(float(-5.9))
-        vx = math.sin(theta)
-        vy = math.cos(theta)
-        length = max(h, w)
-        x0 = int(np.clip(cx - vx * length, 0, w - 1))
-        y0 = int(np.clip(cy - vy * length, 0, h - 1))
-        x1 = int(np.clip(cx + vx * length, 0, w - 1))
-        y1 = int(np.clip(cy + vy * length, 0, h - 1))
-        cv2.line(disp, (x0, y0), (x1, y1), (255, 0, 255), 1, cv2.LINE_AA)
-        ref_x = float(np.clip(103.69 - 40, 0, w - 1))
-        cv2.line(
-            disp,
-            (int(round(ref_x)), 0),
-            (int(round(ref_x)), h - 1),
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
-        denom = (y1 - y0)
-        if abs(denom) < 1e-6:
-            line_x_from_y = None
-        else:
-            line_x_from_y = lambda y_val: x0 + (y_val - y0) * (x1 - x0) / denom
         dot_positions: list[tuple[int, float]] = []
         lowest_dot_x = None
-        if line_x_from_y is not None:
-            band_half = lane_h * 0.5
-            for idx in tracked_indices:
-                band_top = float(bands[idx][0])
-                inter_x = line_x_from_y(band_top)
-                inter_x = float(np.clip(inter_x, 0, w - 1))
-                dot_y = float(band_top + band_half)
-                dot_y = float(np.clip(dot_y, 0, h - 1))
-                dot_positions.append((idx, inter_x))
-                if lowest_dot_x is None:
-                    lowest_dot_x = inter_x
-                cv2.circle(
-                    disp,
-                    (int(round(inter_x)), int(round(dot_y))),
-                    6,
-                    (0, 255, 255),
-                    -1,
-                    cv2.LINE_AA,
-                )
         top_bottom_line_labels = []
         for i, b in enumerate(bands):
             tb = GeometryAnalyzer.classify_band_top_bottom_lines(
@@ -2391,6 +2596,8 @@ def main(capture_backend: Optional[CaptureBackend] = None,
             proc_bgr, bands, lane_h, use_bottom_slice=True
         )
         velocity_estimator.push_color_lines(color_lines, t_now=push_time)
+        if frame_logger is not None:
+            frame_logger.log_frame(push_time, occ_lines, color_lines)
         # run hash velocity on all bands, collect detections
         _all_hash_detections: list[tuple[int, list[dict]]] = []
         for bi in range(min(len(occ_lines), len(color_lines))):
@@ -2398,10 +2605,41 @@ def main(capture_backend: Optional[CaptureBackend] = None,
                 band=bi, occ_line=occ_lines[bi], color_line=color_lines[bi]
             )
             if dets:
+                dets = [d for d in dets if d.get("predicted") or max(d["mean_color_bgr"]) >= 30]
+            if dets:
                 _all_hash_detections.append((bi, dets))
         planner.push_tracked_occ_lines(
             occ_lines=occ_lines, tracked_indices=tracked_indices, t_now=push_time
         )
+
+        # detect tracked-edge touches: mark both objects for 3-frame fill
+        _TOUCH_HORIZON_S = 0.1
+        for _, dets in _all_hash_detections:
+            if len(dets) < 2:
+                continue
+            for i in range(len(dets)):
+                for j in range(i + 1, len(dets)):
+                    a, b = dets[i], dets[j]
+                    # tracked edge position for each object
+                    te_a = a["tracked_edge"]
+                    te_b = b["tracked_edge"]
+                    edge_a = a["centroid_x"] + (a["length"] / 2.0 if te_a == "right" else -a["length"] / 2.0)
+                    edge_b = b["centroid_x"] + (b["length"] / 2.0 if te_b == "right" else -b["length"] / 2.0)
+                    gap = abs(edge_b - edge_a)
+                    rel_vel = b["velocity_px_per_s"] - a["velocity_px_per_s"]
+                    approaching = (edge_b > edge_a and rel_vel < 0) or (edge_a > edge_b and rel_vel > 0)
+                    touch = gap <= 2
+                    if not touch and approaching and abs(rel_vel) > 1e-3:
+                        t_touch = gap / abs(rel_vel)
+                        touch = t_touch <= _TOUCH_HORIZON_S
+                    if touch:
+                        main._obj_flash[a["obj_id"]] = 3
+                        main._obj_flash[b["obj_id"]] = 3
+        # decrement counters
+        for oid in list(main._obj_flash):
+            main._obj_flash[oid] -= 1
+            if main._obj_flash[oid] <= 0:
+                del main._obj_flash[oid]
 
         move_cmd = 'wait'
 
@@ -2431,7 +2669,16 @@ def main(capture_backend: Optional[CaptureBackend] = None,
                 vel = det["velocity_px_per_s"]
                 obj_id = det.get("obj_id", 0)
                 color = _OBJ_COLORS[obj_id % len(_OBJ_COLORS)]
+                if obj_id in main._obj_flash:
+                    overlay = disp.copy()
+                    cv2.rectangle(overlay, (x1, int(y0)), (x2, int(y1)), (255, 255, 0), -1)
+                    cv2.addWeighted(overlay, 0.4, disp, 0.6, 0, disp)
                 cv2.rectangle(disp, (x1, int(y0)), (x2, int(y1)), color, 1)
+                tracked_edge = det.get("tracked_edge", "both")
+                if tracked_edge == "left":
+                    cv2.line(disp, (x1, int(y0)), (x1, int(y1)), color, 3)
+                elif tracked_edge == "right":
+                    cv2.line(disp, (x2, int(y0)), (x2, int(y1)), color, 3)
                 cv2.putText(disp, f"{vel:.0f}",
                             (x1, int(y0) - 2), cv2.FONT_HERSHEY_SIMPLEX,
                             0.3, color, 1, cv2.LINE_AA)
@@ -2493,6 +2740,10 @@ def _parse_runtime_args():
         "--no-display", action="store_true", default=False,
         help="Disable all cv2 debug windows (faster — no macOS Cocoa overhead).",
     )
+    parser.add_argument(
+        "--log-frames", default=None, metavar="PATH",
+        help="JSONL path to log raw per-frame (occ_lines, color_lines) for offline replay.",
+    )
     args = parser.parse_args()
     if args.fps <= 0:
         parser.error("--fps must be a positive integer")
@@ -2512,4 +2763,5 @@ if __name__ == "__main__":
     main(capture_backend=_capture, input_backend=_input, target_fps=args.fps,
          is_desktop=(args.backend == "desktop"),
          show_display=not args.no_display,
+         log_frames_path=args.log_frames,
     )
